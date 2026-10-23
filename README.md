@@ -1,6 +1,6 @@
 # msm
 
-The MSM management console. A Rust binary that pairs with [MSM Console](https://github.com/Multi-Server-Manager/MSMNode).
+The MSM management console. A Rust binary that pairs with [MSM Nodes](https://github.com/Multi-Server-Manager/MSMNode).
 
 The wire format lives in [docs/PROTOCOL.md](docs/PROTOCOL.md). That file is the
 single source of truth for both this repository and the Go node agent, nothing
