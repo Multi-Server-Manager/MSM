@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::messages::{Message, VERSION};
+use crate::messages::{Message, Setup, VERSION};
 
 /// Largest `lines` value `logs.tail` accepts.
 pub const MAX_LOG_LINES: u32 = 500;
@@ -14,6 +14,8 @@ pub const MAX_PACKAGE_NAME_LEN: usize = 64;
 pub const MAX_UNIT_LEN: usize = 64;
 /// Longest request id accepted.
 pub const MAX_REQUEST_ID_LEN: usize = 64;
+/// Longest account name accepted.
+pub const MAX_ACCOUNT_NAME_LEN: usize = 32;
 /// The one token `host.reboot` accepts.
 pub const REBOOT_CONFIRMATION: &str = "reboot";
 
@@ -27,6 +29,8 @@ pub enum Command {
     HostReboot(String),
     MetricsSample,
     LogsTail(u32),
+    /// Change the answers the node's first pairing asked for.
+    NodeSetup(Setup),
 }
 
 impl Command {
@@ -61,6 +65,13 @@ impl Command {
                 id: id.to_string(),
                 lines,
             },
+            Self::NodeSetup(setup) => Message::NodeSetup {
+                v: VERSION,
+                id: id.to_string(),
+                run_as: setup.run_as,
+                ssh_user: setup.ssh_user,
+                ssh_port: setup.ssh_port,
+            },
         }
     }
 
@@ -74,6 +85,10 @@ impl Command {
             Self::HostReboot(_) => "host.reboot".to_string(),
             Self::MetricsSample => "metrics.sample".to_string(),
             Self::LogsTail(lines) => format!("logs.tail {lines}"),
+            Self::NodeSetup(setup) => format!(
+                "node.setup run_as={} ssh_user={} ssh_port={}",
+                setup.run_as, setup.ssh_user, setup.ssh_port
+            ),
         }
     }
 }
@@ -143,6 +158,19 @@ pub struct MetricsResult {
 pub struct SshAuthorizeResult {
     pub path: String,
     pub added: bool,
+    #[serde(default)]
+    pub user: String,
+}
+
+/// `node.setup` payload (§8.13): the answers the node now uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupResult {
+    pub run_as: String,
+    pub ssh_user: String,
+    pub ssh_port: u16,
+    /// Present when the node cannot escalate to `run_as` yet.
+    #[serde(default)]
+    pub warn: String,
 }
 
 /// `logs.tail` payload (§8.10).
@@ -180,6 +208,21 @@ pub fn valid_unit(unit: &str) -> bool {
     bytes.iter().all(|byte| {
         byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'@' | b':' | b'-')
     })
+}
+
+/// Account names the node may look up (§8.13).
+pub fn valid_account(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_ACCOUNT_NAME_LEN {
+        return false;
+    }
+    let first = bytes[0];
+    if !(first.is_ascii_lowercase() || first == b'_') {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.' | b'-'))
 }
 
 /// Request ids travel back in a `result`, so they stay to a printable alphabet.

@@ -55,15 +55,22 @@ fn lines_for(app: &App, width: usize) -> Vec<Line<'static>> {
         Screen::Pair => pair(app, width, &mut lines),
         Screen::Detail => detail(app, width, &mut lines),
         Screen::Logs => logs(app, width, &mut lines),
+        Screen::Session => session(app, &mut lines),
+    }
+    if let Some(edit) = &app.edit {
+        edit_form(edit, width, &mut lines);
     }
     lines.push(Line::from(rule));
     let help = match app.screen {
         Screen::Nodes => {
-            "j/k move  space mark  a all  enter detail  u update  i install  r restart  l logs  s ssh  f sftp  p pair  q quit"
+            "j/k move  space mark  a all  enter detail  u update  i install  r restart  l logs  s ssh  e edit  f sftp  p pair  q quit"
         }
         Screen::Pair => "d discover  up/down choose  tab field  enter next/pair  esc back  q quit",
-        Screen::Detail => "u update  i install  r restart  l logs  s ssh  f sftp  g refresh  esc back  q quit",
+        Screen::Detail => {
+            "u update  i install  r restart  l logs  s ssh  e edit  f sftp  g refresh  esc back  q quit"
+        }
         Screen::Logs => "r refresh  esc back  q quit",
+        Screen::Session => "typing goes to the remote  ctrl-\\ detach  esc back when it ends",
     };
     for line in wrap(help, width) {
         lines.push(Line::from(line));
@@ -245,7 +252,11 @@ fn nodes(app: &App, width: usize, out: &mut Vec<Line<'static>>) {
 }
 
 fn pair(app: &App, width: usize, out: &mut Vec<Line<'static>>) {
-    out.push(header("msm  pair", "3 steps: discover, address, code", width));
+    out.push(header(
+        "msm  pair",
+        "address, code, then where things run",
+        width,
+    ));
     out.push(Line::from("-".repeat(width)));
     out.push(Line::from(""));
     out.push(Line::from("discovered  _msm-node._tcp"));
@@ -283,6 +294,33 @@ fn pair(app: &App, width: usize, out: &mut Vec<Line<'static>>) {
         app.pair.focus == super::app::Focus::Code,
         "7K3M9QXA",
     ));
+
+    out.push(Line::from(""));
+    out.push(Line::from("setup (blank = the node's own answer)"));
+    out.push(field(
+        "name",
+        &app.pair.label,
+        app.pair.focus == super::app::Focus::Label,
+        "sanas",
+    ));
+    out.push(field(
+        "ssh user",
+        &app.pair.ssh_user,
+        app.pair.focus == super::app::Focus::SshUser,
+        "node's answer",
+    ));
+    out.push(field(
+        "ssh port",
+        &app.pair.ssh_port,
+        app.pair.focus == super::app::Focus::SshPort,
+        "node's",
+    ));
+    out.push(field(
+        "commands as",
+        &app.pair.run_as,
+        app.pair.focus == super::app::Focus::RunAs,
+        "node's answer",
+    ));
     if app.pair.busy {
         out.push(Line::from(""));
         let elapsed = app.pair.since.map(|at| at.elapsed()).unwrap_or_default();
@@ -308,7 +346,7 @@ fn field(label: &str, value: &str, focused: bool, placeholder: &str) -> Line<'st
         Style::default()
     };
     Line::from(Span::styled(
-        format!("  {label:<8} [{shown}{cursor}]"),
+        format!("  {label:<11} [{shown}{cursor}]"),
         style,
     ))
 }
@@ -414,6 +452,49 @@ fn logs(app: &App, width: usize, out: &mut Vec<Line<'static>>) {
     let start = app.logs.lines.len().saturating_sub(height);
     for line in &app.logs.lines[start..] {
         out.push(Line::from(line.clone()));
+    }
+}
+
+/// A live SSH session: its screen, then whatever happened last.
+fn session(app: &App, out: &mut Vec<Line<'static>>) {
+    let Some(view) = &app.session else {
+        out.push(Line::from("no session"));
+        return;
+    };
+    let width = view.size.0 as usize;
+    out.push(header(
+        &format!("msm  ssh  {}", view.title),
+        if view.closed.is_some() { "closed" } else { "live" },
+        width,
+    ));
+    out.push(Line::from("-".repeat(width)));
+
+    for row in view.parser.screen().rows(0, view.size.0) {
+        out.push(Line::from(row));
+    }
+}
+
+/// The edit dialog, drawn under the current screen.
+fn edit_form(form: &super::app::EditForm, width: usize, out: &mut Vec<Line<'static>>) {
+    out.push(Line::from("-".repeat(width)));
+    out.push(Line::from("edit node   tab next   enter save   esc cancel"));
+    for field in super::app::EditField::ALL {
+        let focused = form.focus == field;
+        let name = match field {
+            super::app::EditField::Label => "name",
+            super::app::EditField::Host => "address",
+            super::app::EditField::SshUser => "ssh user",
+            super::app::EditField::SshPort => "ssh port",
+            super::app::EditField::RunAs => "commands as",
+        };
+        let cursor = if focused { "_" } else { " " };
+        let line = format!("  {name:<11} [{}{cursor}]", form.value(field));
+        let style = if focused {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        out.push(Line::from(Span::styled(line, style)));
     }
 }
 

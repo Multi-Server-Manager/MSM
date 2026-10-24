@@ -11,6 +11,7 @@ use msm_protocol::commands::{
 use msm_protocol::derive::{Transcript, client_proof, mac_eq, node_proof, pair_keys};
 use msm_protocol::frame::{MAX_FRAME_LEN, read_frame, write_frame};
 use msm_protocol::messages;
+use msm_protocol::messages::Setup;
 use msm_protocol::tls::{Identity, SPKI_LEN, spki_from_cert_der};
 use msm_protocol::{Message, ProtocolError};
 use rand::SeedableRng;
@@ -353,8 +354,28 @@ fn command_roundtrip() {
                 v: 1,
                 id: "a1".into(),
                 key: "ssh-ed25519 AAAA msm-console".into(),
+                user: String::new(),
             },
             r#"{"t":"ssh.authorize","v":1,"id":"a1","key":"ssh-ed25519 AAAA msm-console"}"#,
+        ),
+        (
+            Message::SshAuthorize {
+                v: 1,
+                id: "a1".into(),
+                key: "ssh-ed25519 AAAA msm-console".into(),
+                user: "admin".into(),
+            },
+            r#"{"t":"ssh.authorize","v":1,"id":"a1","key":"ssh-ed25519 AAAA msm-console","user":"admin"}"#,
+        ),
+        (
+            Message::NodeSetup {
+                v: 1,
+                id: "a1".into(),
+                run_as: "root".into(),
+                ssh_user: "admin".into(),
+                ssh_port: 2200,
+            },
+            r#"{"t":"node.setup","v":1,"id":"a1","run_as":"root","ssh_user":"admin","ssh_port":2200}"#,
         ),
     ];
 
@@ -390,6 +411,59 @@ fn command_builders() {
     assert_eq!(Command::LogsTail(5).describe(), "logs.tail 5");
     assert_eq!(Command::SvcRestart(String::new()).describe(), "svc.restart self");
     assert_eq!(Command::HostReboot("reboot".into()).describe(), "host.reboot");
+    assert_eq!(
+        Command::NodeSetup(Setup {
+            run_as: "root".into(),
+            ssh_user: "admin".into(),
+            ssh_port: 22,
+        })
+        .describe(),
+        "node.setup run_as=root ssh_user=admin ssh_port=22"
+    );
+}
+
+#[test]
+fn setup_travels_only_when_answered() {
+    // A console that pairs without answering keeps the old wire shape, so an
+    // older node sees exactly the message it always saw.
+    let proof = Message::PairProof {
+        v: 1,
+        mac: "m".into(),
+        client_id: "c".into(),
+        client_spki: "s".into(),
+        setup: None,
+    };
+    let encoded = String::from_utf8(messages::encode(&proof).expect("encode")).expect("utf8");
+    assert!(!encoded.contains("setup"), "{encoded}");
+
+    let answered = Message::PairProof {
+        v: 1,
+        mac: "m".into(),
+        client_id: "c".into(),
+        client_spki: "s".into(),
+        setup: Some(Setup {
+            run_as: "root".into(),
+            ssh_user: "admin".into(),
+            ssh_port: 2222,
+        }),
+    };
+    let encoded = String::from_utf8(messages::encode(&answered).expect("encode")).expect("utf8");
+    assert!(encoded.contains(r#""setup":{"run_as":"root","ssh_user":"admin","ssh_port":2222}"#));
+
+    // A node that predates the exchange sends neither the key nor the answers.
+    let older: Message = messages::decode(
+        br#"{"t":"pair.ok","v":1,"mac":"m","node_id":"n","node_spki":"s","op_port":7333}"#,
+    )
+    .expect("decode an older pair.ok");
+    match older {
+        Message::PairOk {
+            ssh_key, setup, ..
+        } => {
+            assert!(ssh_key.is_empty());
+            assert!(setup.is_none());
+        }
+        other => panic!("decoded {}", other.kind()),
+    }
 }
 
 #[test]

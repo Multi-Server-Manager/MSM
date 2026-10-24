@@ -8,10 +8,12 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use msm_protocol::commands::Command;
+use msm_protocol::commands::{Command, valid_account};
+use msm_protocol::messages::Setup;
 
 use super::worker::{self, HISTORY, Msg, Sample};
 use crate::mdns::Discovered;
+use crate::session::{self, Event as SessionEvent, Input as SessionInput, Session as SshSession};
 use crate::sshkey::SshKey;
 use crate::store::{self, NodeRecord};
 
@@ -25,6 +27,8 @@ pub enum Screen {
     Pair,
     Detail,
     Logs,
+    /// A live SSH session drawn inside the panel.
+    Session,
 }
 
 /// The state of one node as the panel knows it.
@@ -81,10 +85,18 @@ impl NodeView {
 }
 
 /// The pairing screen's inputs.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PairForm {
     pub address: String,
     pub code: String,
+    /// Name to store for the node; the discovered label is offered first.
+    pub label: String,
+    /// Account the console's key is installed for.
+    pub ssh_user: String,
+    /// Port the console dials for SSH.
+    pub ssh_port: String,
+    /// Account the node runs its commands as.
+    pub run_as: String,
     pub focus: Focus,
     pub discovered: Vec<Discovered>,
     pub chosen: usize,
@@ -132,6 +144,7 @@ pub fn progress_label(request: &Command) -> String {
         Command::HostReboot(_) => "rebooting".to_string(),
         Command::MetricsSample => "reading metrics".to_string(),
         Command::LogsTail(_) => "reading logs".to_string(),
+        Command::NodeSetup(_) => "changing the node's setup".to_string(),
     }
 }
 
@@ -140,6 +153,109 @@ pub enum Focus {
     #[default]
     Address,
     Code,
+    Label,
+    SshUser,
+    SshPort,
+    RunAs,
+}
+
+impl Focus {
+    /// The field Tab moves to, in the order the questions are asked.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Address => Self::Code,
+            Self::Code => Self::Label,
+            Self::Label => Self::SshUser,
+            Self::SshUser => Self::SshPort,
+            Self::SshPort => Self::RunAs,
+            Self::RunAs => Self::Address,
+        }
+    }
+}
+
+/// One field of the edit dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditField {
+    Label,
+    Host,
+    SshUser,
+    SshPort,
+    RunAs,
+}
+
+impl EditField {
+    pub const ALL: [Self; 5] = [
+        Self::Label,
+        Self::Host,
+        Self::SshUser,
+        Self::SshPort,
+        Self::RunAs,
+    ];
+
+    fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|field| *field == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+}
+
+/// The edit dialog: everything about a node a human might rename or repoint.
+#[derive(Debug)]
+pub struct EditForm {
+    /// The record as it was when the dialog opened.
+    pub original: NodeRecord,
+    pub label: String,
+    pub host: String,
+    pub ssh_user: String,
+    pub ssh_port: String,
+    pub run_as: String,
+    pub focus: EditField,
+}
+
+impl EditForm {
+    pub fn for_record(record: NodeRecord) -> Self {
+        Self {
+            label: record.label.clone(),
+            host: record.host.clone(),
+            ssh_user: record.ssh_user.clone(),
+            ssh_port: record.ssh_port.to_string(),
+            run_as: record.run_as.clone(),
+            original: record,
+            focus: EditField::Label,
+        }
+    }
+
+    pub fn value(&self, field: EditField) -> &str {
+        match field {
+            EditField::Label => &self.label,
+            EditField::Host => &self.host,
+            EditField::SshUser => &self.ssh_user,
+            EditField::SshPort => &self.ssh_port,
+            EditField::RunAs => &self.run_as,
+        }
+    }
+
+    fn value_mut(&mut self, field: EditField) -> &mut String {
+        match field {
+            EditField::Label => &mut self.label,
+            EditField::Host => &mut self.host,
+            EditField::SshUser => &mut self.ssh_user,
+            EditField::SshPort => &mut self.ssh_port,
+            EditField::RunAs => &mut self.run_as,
+        }
+    }
+}
+
+/// A live SSH session and the emulator that draws it.
+pub struct SessionView {
+    pub ssh: SshSession,
+    pub parser: vt100::Parser,
+    pub title: String,
+    /// Where Esc returns to when the session ends.
+    pub origin: Screen,
+    /// The size the remote was last told about.
+    pub size: (u16, u16),
+    /// Set once the remote hung up; the screen keeps its last frame.
+    pub closed: Option<String>,
 }
 
 /// The log screen's content.
@@ -163,6 +279,28 @@ pub struct Shell {
     pub args: Vec<String>,
 }
 
+impl Default for PairForm {
+    fn default() -> Self {
+        Self {
+            address: String::new(),
+            code: String::new(),
+            label: String::new(),
+            // Blank means "the node's own answer": the node knows which
+            // account it can command as, the console does not.
+            ssh_user: String::new(),
+            ssh_port: String::new(),
+            run_as: String::new(),
+            focus: Focus::Address,
+            discovered: Vec::new(),
+            chosen: 0,
+            busy: false,
+            working: String::new(),
+            since: None,
+            pick_when_found: false,
+        }
+    }
+}
+
 /// The whole panel.
 pub struct App {
     pub state_dir: PathBuf,
@@ -175,6 +313,12 @@ pub struct App {
     pub logs: LogsView,
     pub prompt: Option<Prompt>,
     pub shell: Option<Shell>,
+    /// The live SSH session, when one is open.
+    pub session: Option<SessionView>,
+    /// The edit dialog, when it is open.
+    pub edit: Option<EditForm>,
+    /// Last drawn size, so a new session and a resize both start correct.
+    pub panel: (u16, u16),
     pub should_quit: bool,
     pub detail_refreshed: Option<Instant>,
     pub busy: Option<Busy>,
@@ -200,6 +344,9 @@ impl App {
             logs: LogsView::default(),
             prompt: None,
             shell: None,
+            session: None,
+            edit: None,
+            panel: (80, 24),
             should_quit: false,
             detail_refreshed: None,
             busy: None,
@@ -214,6 +361,8 @@ impl App {
         while let Ok(message) = self.rx.try_recv() {
             self.apply(message);
         }
+
+        self.drain_session();
 
         if self.screen == Screen::Detail {
             let due = self
@@ -345,6 +494,19 @@ impl App {
                     }
                 }
             }
+            Msg::Configured { record, warning } => {
+                if let Some(view) = self
+                    .nodes
+                    .iter_mut()
+                    .find(|v| v.record.node_id == record.node_id)
+                {
+                    view.record = *record; // the answers the node confirmed
+                }
+                self.status = match warning {
+                    Some(warning) => format!("saved; {warning}"),
+                    None => "saved; the node uses the new settings".to_string(),
+                };
+            }
             Msg::Failed(reason) => {
                 self.pair.busy = false;
                 self.pair.since = None;
@@ -357,6 +519,43 @@ impl App {
     fn mark(&mut self, node_id: &str, status: Status) {
         if let Some(view) = self.nodes.iter_mut().find(|v| v.record.node_id == node_id) {
             view.status = status;
+        }
+    }
+
+    /// Move bytes from the SSH worker into the emulator, and notice a hangup.
+    fn drain_session(&mut self) {
+        let mut closed = None;
+        if let Some(view) = self.session.as_mut() {
+            loop {
+                match view.ssh.events.try_recv() {
+                    Ok(SessionEvent::Opened) => {}
+                    Ok(SessionEvent::Data(bytes)) => view.parser.process(&bytes),
+                    Ok(SessionEvent::Closed(reason)) => {
+                        closed = Some(reason);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        if let Some(reason) = closed {
+            if let Some(view) = self.session.as_mut() {
+                view.closed = Some(reason.clone());
+            }
+            self.status = reason;
+        }
+    }
+
+    /// Tell the session how big the screen is; a resize reaches the remote.
+    pub fn set_panel_size(&mut self, width: u16, height: u16) {
+        self.panel = (width, height);
+        let (cols, rows) = session_size(self.panel);
+        if let Some(view) = self.session.as_mut()
+            && view.size != (cols, rows)
+        {
+            view.size = (cols, rows);
+            view.parser.set_size(nonzero(rows), nonzero(cols));
+            let _ = view.ssh.input.send(SessionInput::Resize(cols, rows));
         }
     }
 
@@ -446,8 +645,61 @@ impl App {
         worker::logs(self.state_dir.clone(), record, 200, self.tx.clone());
     }
 
-    /// Build the SSH or SFTP hand-over for the highlighted node.
-    fn open_shell(&mut self, sftp: bool) {
+    /// Open an SSH login inside the panel, authenticated with the MSM key.
+    ///
+    /// Nothing is handed over: the session draws in the same screen and the
+    /// keys are forwarded to the remote, except Ctrl-\ which closes it.
+    fn open_ssh(&mut self) {
+        let Some(view) = self.current() else {
+            return;
+        };
+        let record = view.record.clone();
+        let name = view.name().to_string();
+
+        // The key must exist before the thread reads it.
+        if let Err(err) = SshKey::load_or_create(&self.state_dir) {
+            self.status = format!("error: cannot prepare the SSH key: {err}");
+            return;
+        }
+
+        let (cols, rows) = session_size(self.panel);
+        let ssh = session::start(session::Start {
+            host: record.host.clone(),
+            port: record.ssh_port,
+            user: record.ssh_user.clone(),
+            key: SshKey::path(&self.state_dir),
+            known_hosts: session::Start::known_hosts_for(&self.state_dir),
+            cols,
+            rows,
+            label: name.clone(),
+        });
+
+        self.session = Some(SessionView {
+            ssh,
+            parser: vt100::Parser::new(nonzero(rows), nonzero(cols), 2000),
+            title: format!("{}@{}", record.ssh_user, record.host),
+            origin: self.screen,
+            size: (cols, rows),
+            closed: None,
+        });
+        self.screen = Screen::Session;
+        self.status = format!("ssh {}@{}:{}", record.ssh_user, record.host, record.ssh_port);
+    }
+
+    /// Close the session and return to where it was opened from.
+    fn close_session(&mut self) {
+        if let Some(view) = self.session.take() {
+            let _ = view.ssh.input.send(SessionInput::Close);
+            self.screen = view.origin;
+        } else {
+            self.screen = Screen::Nodes;
+        }
+        self.status = "session closed".to_string();
+    }
+
+    /// Open SFTP, which is a file browser rather than a shell: it keeps using
+    /// the system client, with the key that pairing installed.
+    fn open_sftp(&mut self) {
         let Some(view) = self.current() else {
             return;
         };
@@ -455,7 +707,7 @@ impl App {
         let key = SshKey::path(&self.state_dir);
         let known_hosts = self.state_dir.join("ssh").join("known_hosts");
 
-        let mut args = vec![
+        let args = vec![
             "-i".to_string(),
             key.display().to_string(),
             "-o".to_string(),
@@ -464,26 +716,111 @@ impl App {
             "StrictHostKeyChecking=accept-new".to_string(),
             "-o".to_string(),
             format!("UserKnownHostsFile={}", known_hosts.display()),
+            "-P".to_string(),
+            record.ssh_port.to_string(),
+            format!("{}@{}", record.ssh_user, record.host),
         ];
-        // sftp and ssh disagree on the port flag.
-        args.push(if sftp { "-P" } else { "-p" }.to_string());
-        args.push(record.ssh_port.to_string());
-        args.push(format!("{}@{}", record.ssh_user, record.host));
 
         self.shell = Some(Shell {
-            program: if sftp { "sftp" } else { "ssh" }.to_string(),
+            program: "sftp".to_string(),
             args,
         });
-        self.status = format!(
-            "{} {}@{}",
-            if sftp { "sftp" } else { "ssh" },
-            record.ssh_user,
-            record.host
-        );
+        self.status = format!("sftp {}@{}", record.ssh_user, record.host);
+    }
+
+    /// Open the edit dialog for the highlighted node.
+    fn open_edit(&mut self) {
+        let Some(view) = self.current() else {
+            return;
+        };
+        self.edit = Some(EditForm::for_record(view.record.clone()));
+        self.status = "tab next field  enter save  esc cancel".to_string();
+    }
+
+    /// Apply the edit dialog: store locally, then tell the node.
+    fn save_edit(&mut self) {
+        let Some(form) = self.edit.take() else {
+            return;
+        };
+
+        let host = form.host.trim().to_string();
+        if host.is_empty() {
+            self.status = "the address cannot be empty".to_string();
+            self.edit = Some(form);
+            return;
+        }
+        let ssh_port: u16 = match form.ssh_port.trim().parse() {
+            Ok(port) if port > 0 => port,
+            _ => {
+                self.status = "the ssh port must be 1-65535".to_string();
+                self.edit = Some(form);
+                return;
+            }
+        };
+        let ssh_user_value = form.ssh_user.trim().to_string();
+        let run_as_value = form.run_as.trim().to_string();
+        for account in [ssh_user_value.as_str(), run_as_value.as_str()] {
+            if !valid_account(account) {
+                self.status = format!(
+                    "{account:?} is not an account name (lowercase letters, digits, . _ -, starting with a letter or _)"
+                );
+                self.edit = Some(form);
+                return;
+            }
+        }
+
+        let setup = Setup {
+            run_as: run_as_value,
+            ssh_user: ssh_user_value,
+            ssh_port,
+        };
+        let before = Setup {
+            run_as: form.original.run_as.clone(),
+            ssh_user: form.original.ssh_user.clone(),
+            ssh_port: form.original.ssh_port,
+        };
+
+        let mut record = form.original.clone();
+        record.label = form.label.trim().to_string();
+        record.host = host;
+        record.ssh_user = setup.ssh_user.clone();
+        record.ssh_port = setup.ssh_port;
+        record.run_as = setup.run_as.clone();
+
+        if let Err(err) = store::save_node(&self.state_dir, record.clone()) {
+            self.status = format!("error: cannot save the node: {err}");
+            return;
+        }
+        if let Some(view) = self
+            .nodes
+            .iter_mut()
+            .find(|v| v.record.node_id == record.node_id)
+        {
+            view.record = record.clone();
+        }
+
+        if setup == before {
+            self.status = "saved".to_string();
+            return;
+        }
+        self.status = "saved; telling the node".to_string();
+        worker::configure(self.state_dir.clone(), record, setup, self.tx.clone());
     }
 
     /// Apply one key press.
     pub fn on_key(&mut self, key: KeyEvent) {
+        // A live session owns the keyboard: Ctrl-C belongs to the remote, and
+        // only the detach key comes back here.
+        if self.screen == Screen::Session {
+            self.on_session_key(key);
+            return;
+        }
+
+        if self.edit.is_some() {
+            self.on_edit_key(key);
+            return;
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c'))
         {
@@ -496,7 +833,9 @@ impl App {
             return;
         }
 
-        if key.code == KeyCode::Char('q') {
+        // `q` quits every browsing screen, but it is a letter in the pairing
+        // form: a label or an address may contain it.
+        if key.code == KeyCode::Char('q') && self.screen != Screen::Pair {
             self.should_quit = true;
             return;
         }
@@ -506,6 +845,91 @@ impl App {
             Screen::Pair => self.on_pair_key(key),
             Screen::Detail => self.on_detail_key(key),
             Screen::Logs => self.on_logs_key(key),
+            Screen::Session => {}
+        }
+    }
+
+    /// Keys inside the session: everything goes to the remote, except Ctrl-\\
+    /// (detach) and Esc after the remote hung up.
+    fn on_session_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('\\') {
+            self.close_session();
+            return;
+        }
+
+        let Some(view) = self.session.as_mut() else {
+            self.screen = Screen::Nodes;
+            return;
+        };
+        if view.closed.is_some() {
+            if key.code == KeyCode::Esc {
+                self.close_session();
+            }
+            return;
+        }
+
+        let bytes = session::key_bytes(key);
+        if !bytes.is_empty() {
+            let _ = view.ssh.input.send(SessionInput::Data(bytes));
+        }
+    }
+
+    /// Keys inside the edit dialog.
+    fn on_edit_key(&mut self, key: KeyEvent) {
+        enum Action {
+            Cancel,
+            Save,
+            Focus(EditField),
+            Pop,
+            Push(char),
+            None,
+        }
+
+        let action = match self.edit.as_ref() {
+            None => return,
+            Some(form) => match key.code {
+                KeyCode::Esc => Action::Cancel,
+                KeyCode::Enter => Action::Save,
+                KeyCode::Tab | KeyCode::Down => Action::Focus(form.focus.next()),
+                KeyCode::BackTab | KeyCode::Up => {
+                    let index = EditField::ALL
+                        .iter()
+                        .position(|field| *field == form.focus)
+                        .unwrap_or(0);
+                    Action::Focus(
+                        EditField::ALL[(index + EditField::ALL.len() - 1) % EditField::ALL.len()],
+                    )
+                }
+                KeyCode::Backspace => Action::Pop,
+                KeyCode::Char(character) => Action::Push(character),
+                _ => Action::None,
+            },
+        };
+
+        match action {
+            Action::Cancel => {
+                self.edit = None;
+                self.status = "edit cancelled".to_string();
+            }
+            Action::Save => self.save_edit(),
+            Action::Focus(field) => {
+                if let Some(form) = self.edit.as_mut() {
+                    form.focus = field;
+                }
+            }
+            Action::Pop => {
+                if let Some(form) = self.edit.as_mut() {
+                    let field = form.focus;
+                    form.value_mut(field).pop();
+                }
+            }
+            Action::Push(character) => {
+                if let Some(form) = self.edit.as_mut() {
+                    let field = form.focus;
+                    form.value_mut(field).push(character);
+                }
+            }
+            Action::None => {}
         }
     }
 
@@ -541,8 +965,9 @@ impl App {
             }),
             KeyCode::Char('r') => self.start(Command::SvcRestart(String::new())),
             KeyCode::Char('l') => self.open_logs(),
-            KeyCode::Char('s') => self.open_shell(false),
-            KeyCode::Char('f') => self.open_shell(true),
+            KeyCode::Char('s') => self.open_ssh(),
+            KeyCode::Char('f') => self.open_sftp(),
+            KeyCode::Char('e') => self.open_edit(),
             KeyCode::Char('g') => {
                 for record in self.targets() {
                     worker::metrics(self.state_dir.clone(), record, self.tx.clone());
@@ -565,8 +990,9 @@ impl App {
             }),
             KeyCode::Char('r') => self.start(Command::SvcRestart(String::new())),
             KeyCode::Char('l') => self.open_logs(),
-            KeyCode::Char('s') => self.open_shell(false),
-            KeyCode::Char('f') => self.open_shell(true),
+            KeyCode::Char('s') => self.open_ssh(),
+            KeyCode::Char('f') => self.open_sftp(),
+            KeyCode::Char('e') => self.open_edit(),
             KeyCode::Char('g') => {
                 self.detail_refreshed = None;
             }
@@ -609,11 +1035,18 @@ impl App {
                 self.pair.busy = false;
                 self.pair.since = None;
             }
-            KeyCode::Tab | KeyCode::BackTab => {
-                self.pair.focus = match focused {
-                    Focus::Address => Focus::Code,
-                    Focus::Code => Focus::Address,
-                };
+            KeyCode::Tab => self.pair.focus = focused.next(),
+            KeyCode::BackTab => {
+                let ring = [
+                    Focus::Address,
+                    Focus::Code,
+                    Focus::Label,
+                    Focus::SshUser,
+                    Focus::SshPort,
+                    Focus::RunAs,
+                ];
+                let index = ring.iter().position(|field| *field == focused).unwrap_or(0);
+                self.pair.focus = ring[(index + ring.len() - 1) % ring.len()];
             }
             KeyCode::Char('d') if self.pair.address.is_empty() && focused == Focus::Address => {
                 self.pair.busy = true;
@@ -643,11 +1076,31 @@ impl App {
                 Focus::Code => {
                     self.pair.code.pop();
                 }
+                Focus::Label => {
+                    self.pair.label.pop();
+                }
+                Focus::SshUser => {
+                    self.pair.ssh_user.pop();
+                }
+                Focus::SshPort => {
+                    self.pair.ssh_port.pop();
+                }
+                Focus::RunAs => {
+                    self.pair.run_as.pop();
+                }
             },
             KeyCode::Enter => self.on_pair_enter(),
             KeyCode::Char(c) => match focused {
                 Focus::Address => self.pair.address.push(c),
                 Focus::Code => self.pair.code.push(c),
+                Focus::Label => self.pair.label.push(c),
+                Focus::SshUser => self.pair.ssh_user.push(c),
+                Focus::SshPort => {
+                    if c.is_ascii_digit() || c == ' ' {
+                        self.pair.ssh_port.push(c);
+                    }
+                }
+                Focus::RunAs => self.pair.run_as.push(c),
             },
             _ => {}
         }
@@ -664,12 +1117,24 @@ impl App {
                     }
                     if let Some(found) = self.pair.discovered.get(self.pair.chosen) {
                         self.pair.address = found.endpoint();
+                        if self.pair.label.is_empty() {
+                            self.pair.label = found.label.clone();
+                        }
                         self.pair.focus = Focus::Code;
                         self.status = format!("address set to {}", self.pair.address);
                     } else {
                         self.status = "type host:port or press d to discover".to_string();
                     }
                 } else {
+                    if self.pair.label.is_empty()
+                        && let Some(found) = self
+                            .pair
+                            .discovered
+                            .iter()
+                            .find(|found| found.endpoint() == self.pair.address)
+                    {
+                        self.pair.label = found.label.clone();
+                    }
                     self.pair.focus = Focus::Code;
                 }
             }
@@ -677,32 +1142,65 @@ impl App {
                 if self.pair.address.is_empty() || self.pair.code.is_empty() || self.pair.busy {
                     return;
                 }
-                let address = self.pair.address.clone();
-                let code = self.pair.code.clone();
-                self.pair.busy = true;
-                self.pair.working = format!("pairing with {address}");
-                self.pair.since = Some(Instant::now());
-                self.status = "pairing".to_string();
+                // The two answers that decide where things run come next.
+                self.pair.focus = Focus::Label;
+                self.status = "name the node, then say where commands run".to_string();
+            }
+            Focus::Label => self.pair.focus = Focus::SshUser,
+            Focus::SshUser => self.pair.focus = Focus::SshPort,
+            Focus::SshPort => {
+                let typed = self.pair.ssh_port.trim();
+                if !typed.is_empty() {
+                    match typed.parse::<u16>() {
+                        Ok(port) if port > 0 => {}
+                        _ => {
+                            self.status = "the ssh port must be 1-65535".to_string();
+                            return;
+                        }
+                    }
+                }
+                self.pair.focus = Focus::RunAs;
+            }
+            Focus::RunAs => self.start_pairing(),
+        }
+    }
 
-                // A discovered node carries its own label and pin; use the label
-                // so the list is readable after pairing.
-                let label = self
-                    .pair
-                    .discovered
-                    .iter()
-                    .find(|found| found.endpoint() == address)
-                    .map(|found| found.label.clone())
-                    .unwrap_or_default();
-
-                worker::pair(
-                    self.state_dir.clone(),
-                    address,
-                    code,
-                    label,
-                    self.tx.clone(),
-                );
+    /// Send the pairing request, with the answers to the setup questions.
+    fn start_pairing(&mut self) {
+        if self.pair.address.is_empty() || self.pair.code.is_empty() || self.pair.busy {
+            return;
+        }
+        // Blank answers are passed through as blank: the node fills them from
+        // its own setup, which is the only side that knows its accounts.
+        let ssh_port: u16 = self.pair.ssh_port.trim().parse().unwrap_or(0);
+        let setup = Setup {
+            run_as: self.pair.run_as.trim().to_string(),
+            ssh_user: self.pair.ssh_user.trim().to_string(),
+            ssh_port,
+        };
+        for account in [&setup.run_as, &setup.ssh_user] {
+            if !account.is_empty() && !valid_account(account) {
+                self.status = "account names are lowercase letters, digits, . _ - and start with a letter or _".to_string();
+                return;
             }
         }
+
+        let address = self.pair.address.clone();
+        let code = self.pair.code.clone();
+        let label = self.pair.label.trim().to_string();
+        self.pair.busy = true;
+        self.pair.working = format!("pairing with {address}");
+        self.pair.since = Some(Instant::now());
+        self.status = "pairing".to_string();
+
+        worker::pair(
+            self.state_dir.clone(),
+            address,
+            code,
+            label,
+            setup,
+            self.tx.clone(),
+        );
     }
 
     fn on_prompt_key(&mut self, key: KeyEvent) {
@@ -729,3 +1227,17 @@ impl App {
     }
 
 }
+
+/// The text area a session gets: the header, the rule and the help line belong
+/// to the panel.
+fn nonzero(value: u16) -> std::num::NonZeroU16 {
+    std::num::NonZeroU16::new(value.max(1)).expect("1 is not zero")
+}
+
+pub fn session_size(panel: (u16, u16)) -> (u16, u16) {
+    let cols = panel.0.max(20);
+    // Header, rule, the session's own rows, another rule, then the help line.
+    let rows = panel.1.saturating_sub(4).max(4);
+    (cols, rows)
+}
+

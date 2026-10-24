@@ -6,6 +6,7 @@ mod human;
 mod mdns;
 mod net;
 mod render;
+mod session;
 mod sshkey;
 mod store;
 mod tailnet;
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand};
 use msm_protocol::ProtocolError;
 use msm_protocol::commands::Command as Request;
+use msm_protocol::messages::Setup;
 
 use crate::fanout::Outcome;
 use crate::store::NodeRecord;
@@ -75,10 +77,35 @@ enum Invocation {
         /// Name to store for this node.
         #[arg(long, value_name = "NAME", default_value = "")]
         label: String,
+        /// Account commands on the node run as; blank keeps the node's answer.
+        #[arg(long, value_name = "ACCOUNT", default_value = "")]
+        run_as: String,
+        /// Account the console's SSH key is installed for; blank keeps the
+        /// node's answer.
+        #[arg(long, value_name = "ACCOUNT", default_value = "")]
+        ssh_user: String,
+        /// Port the console dials for SSH; 0 keeps the node's answer.
+        #[arg(long, value_name = "PORT", default_value_t = 0)]
+        ssh_port: u16,
     },
 
     /// List paired nodes.
     Nodes,
+
+    /// Change where a node runs commands and where SSH logins land.
+    Setup {
+        /// Node label, or node id.
+        target: String,
+        /// Account commands on the node run as.
+        #[arg(long, value_name = "ACCOUNT")]
+        run_as: Option<String>,
+        /// Account the console's SSH key is installed for.
+        #[arg(long, value_name = "ACCOUNT")]
+        ssh_user: Option<String>,
+        /// Port the console dials for SSH.
+        #[arg(long, value_name = "PORT")]
+        ssh_port: Option<u16>,
+    },
 
     /// Look for nodes that are waiting to be paired.
     Discover {
@@ -196,8 +223,20 @@ fn run(mut cli: Cli) -> Result<ExitCode, Failure> {
     };
 
     match command {
-        Invocation::Pair { addr, code, label } => {
-            let outcome = net::pair(&cli.state_dir, &addr, &code, &label)
+        Invocation::Pair {
+            addr,
+            code,
+            label,
+            run_as,
+            ssh_user,
+            ssh_port,
+        } => {
+            let setup = Setup {
+                run_as,
+                ssh_user,
+                ssh_port,
+            };
+            let outcome = net::pair(&cli.state_dir, &addr, &code, &label, &setup)
                 .map_err(|err| Failure::Message(human::pairing(&err, &addr)))?;
             let record = outcome.record;
             println!(
@@ -207,14 +246,56 @@ fn run(mut cli: Cli) -> Result<ExitCode, Failure> {
                 record.host,
                 record.op_port
             );
+            println!(
+                "SETUP run_as={} ssh_user={} ssh_port={}",
+                record.run_as, record.ssh_user, record.ssh_port
+            );
             match outcome.ssh_warning {
                 Some(warning) => eprintln!("msm: {warning}"),
-                None => println!("SSH key installed for {}@{}", record.ssh_user, record.host),
+                None => println!(
+                    "SSH keys traded: console key installed for {}@{}, node key trusted here",
+                    record.ssh_user, record.host
+                ),
             }
             Ok(ExitCode::SUCCESS)
         }
         Invocation::Nodes => {
             list_nodes(&cli.state_dir)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Invocation::Setup {
+            target,
+            run_as,
+            ssh_user,
+            ssh_port,
+        } => {
+            let record = store::find_node(&cli.state_dir, &target)?;
+            let setup = Setup {
+                run_as: run_as.unwrap_or_else(|| record.run_as.clone()),
+                ssh_user: ssh_user.unwrap_or_else(|| record.ssh_user.clone()),
+                ssh_port: ssh_port.unwrap_or(record.ssh_port),
+            };
+            let (updated, warning) = net::configure(&cli.state_dir, &record, &setup)?;
+            if let Some(warning) = &warning {
+                eprintln!("msm: {warning}");
+            }
+
+            // The key has to be in the new account's file, or the next login
+            // would be refused.
+            if updated.ssh_user != record.ssh_user {
+                let key = crate::sshkey::SshKey::load_or_create(&cli.state_dir)?;
+                let result = net::authorize_ssh_key(
+                    &cli.state_dir,
+                    &updated,
+                    &key.public_line,
+                    &updated.ssh_user,
+                )?;
+                println!("SSH key installed in {} ({})", result.user, result.path);
+            }
+            println!(
+                "SETUP run_as={} ssh_user={} ssh_port={}",
+                updated.run_as, updated.ssh_user, updated.ssh_port
+            );
             Ok(ExitCode::SUCCESS)
         }
         Invocation::Discover { wait, tailnet_only } => {
@@ -255,6 +336,15 @@ fn run(mut cli: Cli) -> Result<ExitCode, Failure> {
                 summary.version,
                 summary.pinned_clients
             );
+            if let Some(setup) = summary.setup {
+                println!(
+                    "SETUP run_as={} ssh_user={} ssh_port={}",
+                    setup.run_as, setup.ssh_user, setup.ssh_port
+                );
+            }
+            if !summary.ssh_key.is_empty() {
+                println!("SSH key {}", summary.ssh_key);
+            }
             Ok(ExitCode::SUCCESS)
         }
         Invocation::Update { selection } => dispatch(&cli.state_dir, &selection, Request::PkgUpdate),

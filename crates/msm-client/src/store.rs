@@ -42,6 +42,14 @@ pub struct NodeRecord {
     /// Port the SSH jump connects to.
     #[serde(default = "default_ssh_port")]
     pub ssh_port: u16,
+    /// Account the node runs its commands as; `e` edits it and pushes the
+    /// change to the node.
+    #[serde(default = "default_run_as")]
+    pub run_as: String,
+    /// The node's own SSH public key, traded at pairing so the node can reach
+    /// this console. Empty for a node that never sent one.
+    #[serde(default)]
+    pub node_ssh_key: String,
 }
 
 fn default_ssh_user() -> String {
@@ -50,6 +58,10 @@ fn default_ssh_user() -> String {
 
 fn default_ssh_port() -> u16 {
     22
+}
+
+fn default_run_as() -> String {
+    "root".to_string()
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

@@ -5,7 +5,7 @@
 //! `sftp` can be started from the console with exactly that identity.
 
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -179,6 +179,96 @@ pub fn public_line(public: &[u8]) -> String {
     format!("ssh-ed25519 {} {COMMENT}", b64::encode(&ssh_blob(public)))
 }
 
+/// Trust one node's public key on this computer.
+///
+/// This is the other half of the exchange: the node holds the console's key so
+/// the console can log in, and the console holds the node's key so the node can
+/// log back. The line is validated with the same strictness the node applies to
+/// ours, and a key that is already trusted is left alone.
+pub fn trust(line: &str) -> Result<(PathBuf, bool)> {
+    let path = authorized_keys_path()?;
+    let added = trust_at(&path, line)?;
+    Ok((path, added))
+}
+
+/// The file-level half of [`trust`], so a test can use a temporary file.
+pub fn trust_at(path: &Path, line: &str) -> Result<bool> {
+    let blob = validated_blob(line)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    }
+
+    let existing = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err.into()),
+    };
+
+    if existing
+        .lines()
+        .any(|candidate| blob_of(candidate).as_deref() == Some(blob.as_slice()))
+    {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        return Ok(false);
+    }
+
+    let mut content = existing.trim_end_matches('\n').to_string();
+    if !content.is_empty() {
+        content.push('\n');
+    }
+    content.push_str(line.trim());
+    content.push('\n');
+
+    let temporary = path.with_extension("msm-tmp");
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+    }
+    fs::rename(&temporary, path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(true)
+}
+
+/// `~/.ssh/authorized_keys` for this console account.
+fn authorized_keys_path() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| ProtocolError::Internal("HOME is not set".into()))?;
+    let dir = home.join(".ssh");
+    fs::create_dir_all(&dir)?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    Ok(dir.join("authorized_keys"))
+}
+
+/// The 51-byte blob of one `ssh-ed25519` line, refusing anything else.
+fn validated_blob(line: &str) -> Result<Vec<u8>> {
+    let blob = blob_of(line).ok_or_else(|| {
+        ProtocolError::BadFrame("the node sent something other than an ssh-ed25519 key".into())
+    })?;
+    if blob.len() != 51 || !blob.starts_with(b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20") {
+        return Err(ProtocolError::BadFrame(
+            "the node's key is not a well-formed ed25519 blob".into(),
+        ));
+    }
+    Ok(blob)
+}
+
+/// The decoded key blob of a line, or None when it is not an ed25519 entry.
+fn blob_of(line: &str) -> Option<Vec<u8>> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    if fields.len() < 2 || fields[0] != "ssh-ed25519" {
+        return None;
+    }
+    b64::decode(fields[1]).ok()
+}
+
 /// The unencrypted `openssh-key-v1` container (the format `ssh-keygen` writes
 /// for a key without a passphrase).
 fn openssh_private_key(seed: &[u8; 32], public: &[u8], comment: &str) -> Vec<u8> {
@@ -336,6 +426,31 @@ mod tests {
         // A second load returns the same key rather than rotating it.
         let again = SshKey::load_or_create(&dir).expect("load");
         assert_eq!(again.public_line, key.public_line);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_key_trust() {
+        let dir = std::env::temp_dir().join(format!("msm-trust-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("authorized_keys");
+        fs::write(&path, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoK other\n")
+            .expect("seed");
+
+        let node = SshKey::generate().expect("node key");
+        assert!(trust_at(&path, &node.public_line).expect("trust"), "first sight is added");
+        assert!(!trust_at(&path, &node.public_line).expect("again"), "second sight is a no-op");
+
+        let text = fs::read_to_string(&path).expect("read");
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(text.contains(" other"));
+        assert_eq!(
+            fs::metadata(&path).expect("stat").permissions().mode() & 0o777,
+            0o600
+        );
+        // Something that is not an ed25519 line is refused before any write.
+        assert!(trust_at(&path, "ssh-rsa AAAA nope").is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 

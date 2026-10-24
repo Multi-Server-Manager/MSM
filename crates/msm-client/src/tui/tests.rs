@@ -47,6 +47,8 @@ impl Sandbox {
                 paired_at: 0,
                 ssh_user: "root".to_string(),
                 ssh_port: 22,
+                run_as: "root".to_string(),
+                node_ssh_key: String::new(),
             };
             store::save_node(&dir, record).expect("save a node");
         }
@@ -237,6 +239,8 @@ fn tui_commands_are_the_protocol_commands() {
         paired_at: 0,
         ssh_user: "root".to_string(),
         ssh_port: 22,
+        run_as: "root".to_string(),
+        node_ssh_key: String::new(),
     });
     assert_eq!(view.name(), "id", "an unlabelled node shows its id");
 }
@@ -420,4 +424,135 @@ fn a_pairing_failure_is_marked_and_explained() {
     assert!(app.status.starts_with("error: "), "{}", app.status);
     assert!(app.status.contains("rejected that code"), "{}", app.status);
     assert!(!app.pair.busy);
+}
+
+#[test]
+fn pair_screen_asks_where_things_run() {
+    let sandbox = Sandbox::new(0);
+    let mut app = sandbox.app();
+
+    let text = render_screen(&mut app, Screen::Pair, 80, 26);
+    assert!(text.contains("setup (blank = the node's own answer)"), "{text}");
+    assert!(text.contains("ssh user"), "{text}");
+    assert!(text.contains("ssh port"), "{text}");
+    assert!(text.contains("commands as"), "{text}");
+    assert!(text.contains("name"), "{text}");
+}
+
+#[test]
+fn the_edit_dialog_renames_and_repoints_a_node() {
+    let sandbox = Sandbox::new(1);
+    let mut app = sandbox.app();
+    app.screen = Screen::Nodes;
+
+    app.on_key(key(crossterm::event::KeyCode::Char('e')));
+    assert!(app.edit.is_some(), "e did not open the editor");
+
+    // The label field holds the old name; replace it.
+    for _ in 0..app.edit.as_ref().map(|form| form.label.len()).unwrap_or(0) {
+        app.on_key(key(crossterm::event::KeyCode::Backspace));
+    }
+    for character in "prod".chars() {
+        app.on_key(key(crossterm::event::KeyCode::Char(character)));
+    }
+
+    // host, ssh user, ssh port.
+    for _ in 0..3 {
+        app.on_key(key(crossterm::event::KeyCode::Tab));
+    }
+    for _ in 0..4 {
+        app.on_key(key(crossterm::event::KeyCode::Backspace));
+    }
+    for character in "2200".chars() {
+        app.on_key(key(crossterm::event::KeyCode::Char(character)));
+    }
+
+    let text = render_screen(&mut app, Screen::Nodes, 80, 30);
+    assert!(text.contains("edit node"), "{text}");
+    assert!(text.contains("prod"), "{text}");
+
+    app.on_key(key(crossterm::event::KeyCode::Enter));
+    assert!(app.edit.is_none(), "enter did not save");
+
+    let nodes = store::load_nodes(&sandbox.dir).expect("reload");
+    assert_eq!(nodes[0].label, "prod");
+    assert_eq!(nodes[0].ssh_port, 2200);
+    assert_eq!(app.nodes[0].record.label, "prod");
+}
+
+#[test]
+fn the_edit_dialog_refuses_an_impossible_account() {
+    let sandbox = Sandbox::new(1);
+    let mut app = sandbox.app();
+    app.on_key(key(crossterm::event::KeyCode::Char('e')));
+
+    // label -> host -> ssh user.
+    app.on_key(key(crossterm::event::KeyCode::Tab));
+    app.on_key(key(crossterm::event::KeyCode::Tab));
+    for _ in 0..4 {
+        app.on_key(key(crossterm::event::KeyCode::Backspace));
+    }
+    for character in "Root".chars() {
+        app.on_key(key(crossterm::event::KeyCode::Char(character)));
+    }
+
+    app.on_key(key(crossterm::event::KeyCode::Enter));
+    assert!(app.edit.is_some(), "a bad account closed the dialog");
+    assert!(app.status.contains("not an account name"), "{}", app.status);
+    let nodes = store::load_nodes(&sandbox.dir).expect("reload");
+    assert_eq!(nodes[0].ssh_user, "root", "a refused edit was persisted");
+}
+
+#[test]
+fn a_session_leaves_room_for_the_panel() {
+    assert_eq!(super::app::session_size((80, 24)), (80, 20));
+    assert_eq!(super::app::session_size((10, 2)), (20, 4));
+}
+
+#[test]
+fn the_session_screen_draws_what_the_remote_wrote() {
+    use crate::session::Session;
+    use super::app::SessionView;
+
+    let sandbox = Sandbox::new(0);
+    let mut app = sandbox.app();
+    let (_event_tx, events) = std::sync::mpsc::channel();
+    let (input, _input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut parser = vt100::Parser::new(
+        std::num::NonZeroU16::new(5).expect("rows"),
+        std::num::NonZeroU16::new(40).expect("cols"),
+        100,
+    );
+    parser.process(b"hello from the node\r\n$ ls\r\nfile-a  file-b\r\n");
+
+    app.session = Some(SessionView {
+        ssh: Session { events, input },
+        parser,
+        title: "root@10.89.0.3".to_string(),
+        origin: Screen::Nodes,
+        size: (40, 5),
+        closed: None,
+    });
+    let text = render_screen(&mut app, Screen::Session, 40, 12);
+    assert!(text.contains("msm  ssh  root@10.89.0.3"), "{text}");
+    assert!(text.contains("hello from the node"), "{text}");
+    assert!(text.contains("file-a  file-b"), "{text}");
+    assert!(text.contains("ctrl-\\ detach"), "{text}");
+}
+
+#[test]
+fn q_is_a_letter_while_pairing() {
+    let sandbox = Sandbox::new(0);
+    let mut app = sandbox.app();
+    app.screen = Screen::Pair;
+    app.pair.focus = super::app::Focus::Label;
+
+    app.on_key(key(crossterm::event::KeyCode::Char('q')));
+    assert!(!app.should_quit, "q quit the panel instead of typing");
+    assert_eq!(app.pair.label, "q");
+
+    // Outside a text field it still quits.
+    app.screen = Screen::Nodes;
+    app.on_key(key(crossterm::event::KeyCode::Char('q')));
+    assert!(app.should_quit);
 }

@@ -27,10 +27,24 @@ msm
 # the panel, over the nodes in ~/.msm
 msm discover                              
 # unpaired nodes, mDNS and tailnet
-msm pair --addr 100.74.163.8:7334 --code 7K3M9QXA --label sanas
+msm pair --addr 100.74.163.8:7334 --code 7K3M9QXA --label sanas \
+         --run-as root --ssh-user root --ssh-port 22
 msm nodes
 msm info sanas
+msm setup sanas --ssh-port 2200            # change the answers, no restart
 ```
+
+## The panel
+
+| key | what it does |
+|---|---|
+| `j` / `k`, `space`, `a` | move, mark, mark all |
+| `enter` | open a node |
+| `u` `i` `r` `l` | update, install, restart, logs |
+| `s` | SSH login **inside the panel** |
+| `e` | edit name, address, ssh user/port and the account commands run as |
+| `f` | sftp (hands the terminal over) |
+| `p`, `q` | pair, quit |
 
 ## Testing & Contributing
 [docs/TESTING.md](docs/TESTING.md) is the full plan for testing changes.

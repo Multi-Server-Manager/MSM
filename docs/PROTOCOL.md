@@ -149,6 +149,7 @@ handshake failure.
 | `mac` | b64(32) | `client_mac` from §7 |
 | `client_id` | b64(16) | client identity id |
 | `client_spki` | b64(44) | client identity SPKI |
+| `setup` | object | optional; the console's answers to the setup questions (§8.13). Absent keeps whatever the node already has, and so does an empty field inside it |
 
 ### 6.4 `pair.ok` — node → client
 
@@ -160,6 +161,9 @@ handshake failure.
 | `node_id` | b64(16) | repeated, must match the challenge |
 | `node_spki` | b64(44) | repeated, must match the challenge |
 | `op_port` | integer | repeated, must match the challenge |
+| `ssh_key` | string | optional; the node's own `ssh-ed25519` line, for the return direction |
+| `setup` | object | optional; the answers the node now uses |
+| `warn` | string | optional; why the answers cannot work yet, e.g. the node may not escalate to `run_as` |
 
 ## 7. Transcript, key schedule and proofs
 
@@ -264,6 +268,8 @@ failures that happen before a command is dispatched.
 | `os` | string | `GOOS/GOARCH` |
 | `version` | string | node binary version |
 | `pinned_clients` | integer | number of pinned client identities |
+| `ssh_key` | string | optional; the node's own `ssh-ed25519` line |
+| `setup` | object | optional; the answers now in force (§8.13) |
 
 ### 8.3 Command requests
 
@@ -285,6 +291,17 @@ Neither `name` nor `unit` may begin with `-`, `+`, `.` or `:`. The element after
 the verb is what `dnf`, `apt-get`, `pacman`, `apk` and `systemctl` read as a flag
 or a path, so those leading characters are `bad_argument` even though the rest
 of the charset allows them. An empty `name` is always `bad_argument`.
+
+Commands run as the account named by the node's `setup.run_as` (§8.13), which
+defaults to the account the agent itself runs as. A node that already is that
+account starts the process directly; a node running as root switches the child's
+credentials; any other node prefixes `sudo -n --` (or `sudo -n -u <account> --`).
+`sudo` is never allowed to prompt: when it would, the request is refused with
+`failed` and a detail naming the sudoers rule that would fix it. The `commands`
+member of a package payload carries the argv that really ran, `sudo` included.
+
+A non-zero exit reports the manager's own explanation in `detail`, not just the
+exit code: the line naming the failure is preferred over a trailing hint line.
 
 ### 8.4 `result` — node → client
 
@@ -383,21 +400,68 @@ before touching any file:
   length and exactly 32 key bytes;
 - the optional comment is `[A-Za-z0-9@._-]{0,64}`.
 
-Anything else is `bad_argument` and no file is read or written. The key is
-appended to `~/.ssh/authorized_keys` (directory 0700, file 0600) only when the
-same blob is not already present, so pairing twice is idempotent. A node that
-cannot write the file answers `failed`.
+Anything else is `bad_argument` and no file is read or written.
+
+| field | type | value |
+|---|---|---|
+| `user` | string | optional; the account the line is installed for. Absent means the node's configured `setup.ssh_user` |
+
+The account is resolved on the node, and the line is appended to that account's
+`~/.ssh/authorized_keys` (directory 0700, file 0600) only when the same blob is
+not already present, so pairing twice is idempotent. Writing another account's
+file uses the same privilege path as a command: credential switching when the
+agent is root, `sudo -n` otherwise. A node that cannot write the file answers
+`failed`.
 
 Data:
 
 ```
-{ "path": "/root/.ssh/authorized_keys", "added": true }
+{ "path": "/root/.ssh/authorized_keys", "added": true, "user": "root" }
 ```
 
-`added` is false when the key was already installed. This is the only message
-added for the SSH jump: the key is exchanged over the channel the pairing pin
-already authenticated, so the pairing transcript and every derived value are
-unchanged.
+`added` is false when the key was already installed. The key is exchanged over
+the channel the pairing pin already authenticated, so the pairing transcript and
+every derived value are unchanged.
+
+The reverse direction uses `pair.ok`: the node's own `ssh_key` is written to the
+console account's `~/.ssh/authorized_keys` by the console. Both sides therefore
+hold an MSM-managed keypair and can log in to each other without a password.
+
+### 8.13 `node.setup` — client → node
+
+```
+{ "t": "node.setup", "v": 1, "id": "…",
+  "run_as": "root", "ssh_user": "admin", "ssh_port": 22 }
+```
+
+Changes the answers the node's first pairing asked for:
+
+| field | type | value |
+|---|---|---|
+| `run_as` | string | `[a-z_][a-z0-9_.-]{0,31}`: account package and service commands run as |
+| `ssh_user` | string | same charset: account console SSH keys are installed for |
+| `ssh_port` | integer | `1…65535`: port a console dials for SSH |
+
+In `node.setup` all three are required. In `pair.proof` each may be empty (or
+port `0`), which means "keep the answer this node already has" — that is how a
+console that typed nothing defers to the node's own accounts instead of forcing
+root. The node resolves the accounts before storing anything: a name this host
+does not have is `failed` and nothing changes. A bad charset or port is
+`bad_argument`. On success the node applies the change without a restart
+and answers:
+
+```
+{ "run_as": "root", "ssh_user": "admin", "ssh_port": 22, "warn": "…" }
+```
+
+`warn` is present only when the answers were stored but cannot be used yet —
+the node cannot become `run_as` and said why. The change is still applied: an
+operator may fix the sudoers rule while the node is reachable, and the console
+shows the same sentence instead of letting every command fail.
+
+The same object travels in `pair.proof` and in both `pair.ok` and `info.ok`, so a
+console always knows the answers in force. `run_as` is also what the node prints
+at startup (`SETUP run_as=… ssh_user=… ssh_port=…`).
 
 ### 8.12 Limits and serialisation
 
@@ -515,6 +579,10 @@ other.
 | `logs.tail` bounds are enforced | `logs_tail_bounds` | node |
 | log ring keeps the newest lines and counts drops | `log_ring` | node |
 | `ssh.authorize` validates before writing anything | `ssh_authorize` | node |
+| account names cannot smuggle flags or paths | `account_charset` | both |
+| `pair.proof` omits `setup` when it was not answered | `setup_travels_only_when_answered` | both |
+| `node.setup` applies, persists and refuses a bad account | `node_setup_command` | node |
+| the console trusts the node key and reuses it across sessions | `ssh_key_trust` | client |
 | the mDNS answer carries PTR, SRV, TXT and A | `mdns_response` | node |
 | an mDNS answer parses into one endpoint | `mdns_parses_an_answer` | client |
 | the console SSH key round-trips through its OpenSSH encoding | `ssh_key_roundtrip` | client |

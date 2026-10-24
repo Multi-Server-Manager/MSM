@@ -7,7 +7,7 @@ use crate::error::{ProtocolError, Result};
 pub const VERSION: u16 = 1;
 
 /// Every message type defined in `PROTOCOL.md` §6 and §8.
-pub const KNOWN_TYPES: [&str; 15] = [
+pub const KNOWN_TYPES: [&str; 16] = [
     "pair.hello",
     "pair.challenge",
     "pair.proof",
@@ -22,8 +22,29 @@ pub const KNOWN_TYPES: [&str; 15] = [
     "metrics.sample",
     "logs.tail",
     "ssh.authorize",
+    "node.setup",
     "result",
 ];
+
+/// The node's setup answers (§8.13): which account commands run as, where SSH
+/// logins land, and the port a console dials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Setup {
+    pub run_as: String,
+    pub ssh_user: String,
+    pub ssh_port: u16,
+}
+
+impl Setup {
+    /// The answer set a fresh install starts from.
+    pub fn defaults() -> Self {
+        Self {
+            run_as: "root".to_string(),
+            ssh_user: "root".to_string(),
+            ssh_port: 22,
+        }
+    }
+}
 
 /// One wire message. The `t` member is the tag, so a serialised value carries
 /// the type name exactly once.
@@ -51,6 +72,10 @@ pub enum Message {
         mac: String,
         client_id: String,
         client_spki: String,
+        /// Answers to the first-run questions; absent means "keep what the
+        /// node already has".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        setup: Option<Setup>,
     },
 
     #[serde(rename = "pair.ok")]
@@ -60,6 +85,16 @@ pub enum Message {
         node_id: String,
         node_spki: String,
         op_port: u16,
+        /// The node's own SSH public key, so the console can trust the return
+        /// direction. Absent from a node older than the key exchange.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        ssh_key: String,
+        /// The answers the node now uses.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        setup: Option<Setup>,
+        /// Why the answers cannot work yet, when they cannot (§8.13).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        warn: String,
     },
 
     #[serde(rename = "info")]
@@ -73,6 +108,10 @@ pub enum Message {
         os: String,
         version: String,
         pinned_clients: u32,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        ssh_key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        setup: Option<Setup>,
     },
 
     #[serde(rename = "error")]
@@ -105,7 +144,25 @@ pub enum Message {
     LogsTail { v: u16, id: String, lines: u32 },
 
     #[serde(rename = "ssh.authorize")]
-    SshAuthorize { v: u16, id: String, key: String },
+    SshAuthorize {
+        v: u16,
+        id: String,
+        key: String,
+        /// The account the key is installed for; absent means the node's own
+        /// configured SSH account.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user: String,
+    },
+
+    /// Change the node's setup answers from a pinned console (§8.13).
+    #[serde(rename = "node.setup")]
+    NodeSetup {
+        v: u16,
+        id: String,
+        run_as: String,
+        ssh_user: String,
+        ssh_port: u16,
+    },
 
     /// The single response envelope for every command (§8.4). Members that do
     /// not apply are absent, never empty strings or nulls.
@@ -141,6 +198,7 @@ impl Message {
             Self::MetricsSample { .. } => "metrics.sample",
             Self::LogsTail { .. } => "logs.tail",
             Self::SshAuthorize { .. } => "ssh.authorize",
+            Self::NodeSetup { .. } => "node.setup",
             Self::Result { .. } => "result",
         }
     }

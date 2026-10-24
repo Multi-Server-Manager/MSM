@@ -1,8 +1,8 @@
 //! The panel: a spare, monospace view of the paired nodes.
 //!
-//! The terminal is borrowed for the whole run, except while `ssh` or `sftp`
-//! owns it: there the panel leaves the alternate screen, restores the terminal
-//! and takes both back when the child exits.
+//! The terminal belongs to the panel for the whole run. An SSH login is drawn
+//! in the same screen (see `session`); only `sftp`, a file browser rather than
+//! a shell, borrows the terminal and gives it back when it exits.
 
 pub mod app;
 pub mod ui;
@@ -66,6 +66,13 @@ fn leave(panel: &mut Panel) -> Result<()> {
 
 fn event_loop(panel: &mut Panel, app: &mut App) -> Result<()> {
     while !app.should_quit {
+        // The session's terminal and the panel share one window; tell the
+        // remote the size it really has before drawing it.
+        let size = panel
+            .size()
+            .map_err(|err| ProtocolError::Internal(format!("cannot read the panel size: {err}")))?;
+        app.set_panel_size(size.width, size.height);
+
         panel
             .draw(|frame| ui::draw(frame, app))
             .map_err(|err| ProtocolError::Internal(format!("cannot draw: {err}")))?;

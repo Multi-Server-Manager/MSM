@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 
 use msm_protocol::Message;
 use msm_protocol::commands::{
-    Command, LogsResult, MetricsResult, PackageResult, RebootResult, ServiceResult,
+    Command, LogsResult, MetricsResult, PackageResult, RebootResult, ServiceResult, SetupResult,
 };
 use serde_json::Value;
 
@@ -110,6 +110,13 @@ fn summary(command: &Command, data: &Value, extra: &mut Vec<String>) -> Option<S
         Command::HostReboot(_) => {
             let payload: RebootResult = serde_json::from_value(data.clone()).ok()?;
             Some(format!("method={}", payload.method))
+        }
+        Command::NodeSetup(_) => {
+            let payload: SetupResult = serde_json::from_value(data.clone()).ok()?;
+            Some(format!(
+                "run_as={} ssh_user={} ssh_port={}",
+                payload.run_as, payload.ssh_user, payload.ssh_port
+            ))
         }
     }
 }

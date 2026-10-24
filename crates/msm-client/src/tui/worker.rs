@@ -13,6 +13,7 @@ use std::thread;
 
 use msm_protocol::Message;
 use msm_protocol::commands::{Command, LogsResult, MetricsResult};
+use msm_protocol::messages::Setup;
 use serde_json::Value;
 
 use crate::discovery;
@@ -58,6 +59,11 @@ pub enum Msg {
         lines: Vec<String>,
     },
     Paired {
+        record: Box<NodeRecord>,
+        warning: Option<String>,
+    },
+    /// The node accepted (or refused) an edited setup.
+    Configured {
         record: Box<NodeRecord>,
         warning: Option<String>,
     },
@@ -170,10 +176,11 @@ pub fn pair(
     addr: String,
     code: String,
     label: String,
+    setup: Setup,
     tx: Sender<Msg>,
 ) {
     thread::spawn(move || {
-        match net::pair(&state_dir, &addr, &code, &label) {
+        match net::pair(&state_dir, &addr, &code, &label, &setup) {
             Ok(outcome) => {
                 let _ = tx.send(Msg::Paired {
                     record: Box::new(outcome.record),
@@ -184,6 +191,52 @@ pub fn pair(
                 let _ = tx.send(Msg::Failed(human::pairing(&err, &addr)));
             }
         }
+    });
+}
+
+/// Push edited answers to a node, then make sure the console key is installed
+/// for the account that will receive it.
+pub fn configure(state_dir: PathBuf, record: NodeRecord, setup: Setup, tx: Sender<Msg>) {
+    thread::spawn(move || {
+        let endpoint = format!("{}:{}", record.host, record.op_port);
+        let mut warnings = Vec::new();
+
+        let updated = match net::configure(&state_dir, &record, &setup) {
+            Ok((updated, warning)) => {
+                if let Some(warning) = warning {
+                    warnings.push(warning);
+                }
+                Some(updated)
+            }
+            Err(err) => {
+                warnings.push(format!(
+                    "the node did not accept the change: {}",
+                    human::command(&err, &endpoint)
+                ));
+                None
+            }
+        };
+
+        let target = updated.as_ref().unwrap_or(&record);
+        match crate::sshkey::SshKey::load_or_create(&state_dir) {
+            Ok(key) => {
+                if let Err(err) =
+                    net::authorize_ssh_key(&state_dir, target, &key.public_line, &setup.ssh_user)
+                {
+                    warnings.push(format!("the console key was not installed: {err}"));
+                }
+            }
+            Err(err) => warnings.push(format!("cannot load the console key: {err}")),
+        }
+
+        let _ = tx.send(Msg::Configured {
+            record: Box::new(target.clone()),
+            warning: if warnings.is_empty() {
+                None
+            } else {
+                Some(warnings.join("; "))
+            },
+        });
     });
 }
 

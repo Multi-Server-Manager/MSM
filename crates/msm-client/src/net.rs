@@ -11,7 +11,7 @@ use msm_protocol::b64;
 use msm_protocol::code::normalize_code;
 use msm_protocol::derive::{Transcript, client_proof, mac_eq, node_proof, pair_keys};
 use msm_protocol::commands::{Command, SshAuthorizeResult};
-use msm_protocol::messages::{self, Message};
+use msm_protocol::messages::{self, Message, Setup};
 use msm_protocol::tls::{Identity, client_config, server_name, spki_from_cert_der};
 use msm_protocol::{ProtocolError, Result, read_frame, write_frame};
 use rand::RngCore;
@@ -52,10 +52,24 @@ pub struct InfoSummary {
     pub os: String,
     pub version: String,
     pub pinned_clients: u32,
+    /// Answers the node currently uses, when it is new enough to send them.
+    pub setup: Option<Setup>,
+    /// The node's own SSH public key, when it is new enough to send one.
+    pub ssh_key: String,
 }
 
 /// Pair with a node using its one-time code, pin its identity and store it.
-pub fn pair(state_dir: &Path, addr: &str, code: &str, label: &str) -> Result<PairOutcome> {
+///
+/// `setup` is what the console answered on the pairing screen. The node applies
+/// it before acknowledging, and the acknowledgement is authoritative: a node
+/// that already had answers keeps them unless `setup` is sent.
+pub fn pair(
+    state_dir: &Path,
+    addr: &str,
+    code: &str,
+    label: &str,
+    setup: &Setup,
+) -> Result<PairOutcome> {
     let code = normalize_code(code)?;
     let identity = store::load_or_create_identity(state_dir)?;
     let mut session = connect(addr, &identity, None, IO_TIMEOUT)?;
@@ -141,17 +155,22 @@ pub fn pair(state_dir: &Path, addr: &str, code: &str, label: &str) -> Result<Pai
             mac: b64::encode(&client_proof(&client_key, &transcript)),
             client_id: identity.id_b64(),
             client_spki: identity.spki_b64(),
+            setup: Some(setup.clone()),
         },
     )?;
 
-    let (ack_mac, ack_node_id, ack_spki, ack_port) = match receive(&mut session)? {
-        Message::PairOk {
-            mac,
-            node_id,
-            node_spki,
-            op_port,
-            ..
-        } => (mac, node_id, node_spki, op_port),
+    let (ack_mac, ack_node_id, ack_spki, ack_port, ack_key, ack_setup, ack_warn) =
+        match receive(&mut session)? {
+            Message::PairOk {
+                mac,
+                node_id,
+                node_spki,
+                op_port,
+                ssh_key,
+                setup,
+                warn,
+                ..
+            } => (mac, node_id, node_spki, op_port, ssh_key, setup, warn),
         Message::Error { code, detail, .. } => return Err(ProtocolError::Peer { code, detail }),
         other => {
             return Err(ProtocolError::UnknownType(format!(
@@ -172,6 +191,22 @@ pub fn pair(state_dir: &Path, addr: &str, code: &str, label: &str) -> Result<Pai
     }
 
     let ssh_key = SshKey::load_or_create(state_dir)?;
+    // The node's acknowledgement is authoritative. A node too old to send a
+    // setup block leaves the console's answers in force, with root and port 22
+    // as the last resort for fields that were left blank.
+    let effective = ack_setup.unwrap_or_else(|| Setup {
+        run_as: if setup.run_as.is_empty() {
+            "root".to_string()
+        } else {
+            setup.run_as.clone()
+        },
+        ssh_user: if setup.ssh_user.is_empty() {
+            "root".to_string()
+        } else {
+            setup.ssh_user.clone()
+        },
+        ssh_port: if setup.ssh_port == 0 { 22 } else { setup.ssh_port },
+    });
     let record = NodeRecord {
         node_id: node_id_text,
         spki: node_spki_text,
@@ -179,21 +214,101 @@ pub fn pair(state_dir: &Path, addr: &str, code: &str, label: &str) -> Result<Pai
         host: host_of(addr)?,
         op_port,
         paired_at: store::now_unix(),
-        ssh_user: "root".to_string(),
-        ssh_port: 22,
+        ssh_user: effective.ssh_user,
+        ssh_port: effective.ssh_port,
+        run_as: effective.run_as,
+        node_ssh_key: ack_key.clone(),
     };
     store::save_node(state_dir, record.clone())?;
 
     // The key travels over the channel the pin now authenticates, so the
     // pairing transcript itself is unchanged (PROTOCOL.md §8.11).
-    let ssh_warning = authorize_ssh_key(state_dir, &record, &ssh_key.public_line)
-        .err()
-        .map(|err| format!("the SSH key was not installed: {err}"));
+    let mut warnings = Vec::new();
+    if !ack_warn.is_empty() {
+        warnings.push(ack_warn);
+    }
+    if let Err(err) = authorize_ssh_key(state_dir, &record, &ssh_key.public_line, &record.ssh_user) {
+        warnings.push(format!("the console key was not installed: {err}"));
+    }
+
+    // The return direction: the node's key is trusted here, so it can log in to
+    // this console without a shared password.
+    if !ack_key.is_empty()
+        && let Err(err) = crate::sshkey::trust(&ack_key)
+    {
+        warnings.push(format!("the node's key was not trusted: {err}"));
+    }
 
     Ok(PairOutcome {
         record,
-        ssh_warning,
+        ssh_warning: if warnings.is_empty() {
+            None
+        } else {
+            Some(warnings.join("; "))
+        },
     })
+}
+
+/// Change the node's setup answers and record what it now uses.
+///
+/// The warning is the node's own explanation when the answers cannot work yet
+/// (it cannot escalate to `run_as`), which is worth showing instead of letting
+/// commands fail one by one.
+pub fn configure(
+    state_dir: &Path,
+    record: &NodeRecord,
+    setup: &Setup,
+) -> Result<(NodeRecord, Option<String>)> {
+    let identity = store::load_or_create_identity(state_dir)?;
+    let pin = b64::decode(&record.spki)?;
+    let endpoint = format!("{}:{}", record.host, record.op_port);
+    let mut session = connect(&endpoint, &identity, Some(pin), IO_TIMEOUT)?;
+
+    send(
+        &mut session,
+        &Message::NodeSetup {
+            v: messages::VERSION,
+            id: crate::fanout::request_id(),
+            run_as: setup.run_as.clone(),
+            ssh_user: setup.ssh_user.clone(),
+            ssh_port: setup.ssh_port,
+        },
+    )?;
+
+    let applied = match receive(&mut session)? {
+        Message::Result {
+            ok: true,
+            data: Some(data),
+            ..
+        } => serde_json::from_value::<msm_protocol::commands::SetupResult>(data).map_err(|_| {
+            ProtocolError::BadFrame("node.setup returned an unexpected payload".into())
+        })?,
+        Message::Result { code, detail, .. } => {
+            return Err(ProtocolError::Peer {
+                code: code.unwrap_or_default(),
+                detail: detail.unwrap_or_default(),
+            });
+        }
+        Message::Error { code, detail, .. } => return Err(ProtocolError::Peer { code, detail }),
+        other => {
+            return Err(ProtocolError::UnknownType(format!(
+                "expected result, got {}",
+                other.kind()
+            )));
+        }
+    };
+
+    let mut updated = record.clone();
+    updated.run_as = applied.run_as;
+    updated.ssh_user = applied.ssh_user;
+    updated.ssh_port = applied.ssh_port;
+    store::save_node(state_dir, updated.clone())?;
+    let warning = if applied.warn.is_empty() {
+        None
+    } else {
+        Some(applied.warn)
+    };
+    Ok((updated, warning))
 }
 
 /// Install the console's public key into a node's authorized_keys.
@@ -201,6 +316,7 @@ pub fn authorize_ssh_key(
     state_dir: &Path,
     record: &NodeRecord,
     key: &str,
+    user: &str,
 ) -> Result<SshAuthorizeResult> {
     let identity = store::load_or_create_identity(state_dir)?;
     let pin = b64::decode(&record.spki)?;
@@ -213,6 +329,7 @@ pub fn authorize_ssh_key(
             v: messages::VERSION,
             id: crate::fanout::request_id(),
             key: key.to_string(),
+            user: user.to_string(),
         },
     )?;
 
@@ -259,6 +376,8 @@ pub fn info(state_dir: &Path, target: &str) -> Result<InfoSummary> {
             os,
             version,
             pinned_clients,
+            ssh_key,
+            setup,
             ..
         } => Ok(InfoSummary {
             node_id,
@@ -266,6 +385,8 @@ pub fn info(state_dir: &Path, target: &str) -> Result<InfoSummary> {
             os,
             version,
             pinned_clients,
+            setup,
+            ssh_key,
         }),
         Message::Error { code, detail, .. } => Err(ProtocolError::Peer { code, detail }),
         other => Err(ProtocolError::UnknownType(format!(
