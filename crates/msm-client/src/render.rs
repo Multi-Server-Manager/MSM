@@ -77,7 +77,13 @@ fn summary(command: &Command, data: &Value, extra: &mut Vec<String>) -> Option<S
         Command::PkgUpdate | Command::PkgInstall(_) => {
             let payload: PackageResult = serde_json::from_value(data.clone()).ok()?;
             extra.extend(output_lines(&payload.output));
-            Some(format!("exit={} manager={}", payload.exit_code, payload.manager))
+            // The node phrases the outcome ("there were no updates", "3
+            // packages were updated"); an older node sends no sentence, so
+            // fall back to the numbers it does send.
+            Some(match payload.summary.as_deref() {
+                Some(summary) if !summary.is_empty() => summary.to_string(),
+                _ => format!("exit={} manager={}", payload.exit_code, payload.manager),
+            })
         }
         Command::MetricsSample => {
             let payload: MetricsResult = serde_json::from_value(data.clone()).ok()?;
@@ -127,4 +133,58 @@ fn output_lines(output: &str) -> Vec<String> {
         .filter(|line| !line.trim().is_empty())
         .map(|line| line.to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn outcome_with(data: Value) -> Outcome {
+        Outcome {
+            label: "sanas".to_string(),
+            endpoint: "127.0.0.1:7333".to_string(),
+            elapsed: Duration::from_millis(400),
+            reply: Ok(Message::Result {
+                v: 1,
+                id: "req-1".to_string(),
+                ok: true,
+                code: None,
+                detail: None,
+                data: Some(data),
+            }),
+        }
+    }
+
+    fn package(summary: Option<&str>) -> Value {
+        serde_json::to_value(PackageResult {
+            manager: "dnf".to_string(),
+            commands: vec![vec![
+                "dnf".to_string(),
+                "-y".to_string(),
+                "upgrade".to_string(),
+            ]],
+            exit_code: 0,
+            output: "Nothing to do.".to_string(),
+            summary: summary.map(str::to_string),
+        })
+        .expect("package payload")
+    }
+
+    #[test]
+    fn a_package_run_reads_as_a_sentence() {
+        let out = lines(
+            &outcome_with(package(Some("there were no updates"))),
+            &Command::PkgUpdate,
+            8,
+        );
+        assert!(out[0].contains("there were no updates"), "{}", out[0]);
+        assert!(!out[0].contains("exit=0"), "{}", out[0]);
+    }
+
+    #[test]
+    fn a_node_without_a_summary_still_reports_the_numbers() {
+        let out = lines(&outcome_with(package(None)), &Command::PkgUpdate, 8);
+        assert!(out[0].contains("exit=0 manager=dnf"), "{}", out[0]);
+    }
 }

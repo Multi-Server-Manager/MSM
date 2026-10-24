@@ -28,10 +28,7 @@ pub struct Outcome {
 impl Outcome {
     /// True when the node answered with `result` and `ok: true`.
     pub fn succeeded(&self) -> bool {
-        matches!(
-            &self.reply,
-            Ok(Message::Result { ok: true, .. })
-        )
+        matches!(&self.reply, Ok(Message::Result { ok: true, .. }))
     }
 
     /// The refusal code, when the node refused the command.
@@ -93,7 +90,9 @@ pub fn execute(nodes: &[NodeRecord], state_dir: &Path, command: &Command) -> Vec
                     label: label_of(&record.label),
                     endpoint: format!("{}:{}", record.host, record.op_port),
                     elapsed: Duration::ZERO,
-                    reply: Err(ProtocolError::Internal("the console thread panicked".into())),
+                    reply: Err(ProtocolError::Internal(
+                        "the console thread panicked".into(),
+                    )),
                 },
             })
             .collect()

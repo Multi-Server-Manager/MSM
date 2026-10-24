@@ -4,7 +4,8 @@
 Two passes:
 
 1. interactive — the binary in a pty: pair with a discovered node, list it,
-   open the node, run an update, hand the terminal to ``ssh``, come back, quit;
+   open the node, run an update, open an SSH login in the panel, detach it,
+   resume it, end it with ``x``, hand the terminal to ``sftp`` and come back;
 2. headless — ``msm --render nodes|pair|detail|logs`` and a check that each
    screen drew what it should.
 
@@ -235,6 +236,17 @@ class Panel:
             return os.waitstatus_to_exitcode(self.raw)
 
 
+def finished(panel, busy_label, timeout=150.0):
+    """Wait until the activity line leaves `busy_label` behind."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        panel.drain()
+        if busy_label not in panel.text:
+            return True
+        time.sleep(0.3)
+    return False
+
+
 def interactive(binary, state_dir, code, expect_label):
     print("== interactive pty")
     panel = Panel([binary, "--state-dir", state_dir])
@@ -290,8 +302,7 @@ def interactive(binary, state_dir, code, expect_label):
 
         panel.send("u")
         panel.expect("update runs against the node", "pkg.update", timeout=30)
-        finished = panel.read_until("exit 0 via", timeout=150)
-        check("update reported a real result", finished, panel.text[-400:])
+        check("update finished and reported", finished(panel, "updating packages"), panel.text[-400:])
 
         panel.send("i")
         panel.expect("the install prompt opens", "install package", timeout=10)
@@ -299,20 +310,47 @@ def interactive(binary, state_dir, code, expect_label):
         panel.expect("the prompt shows what was typed", "install package: sl_", timeout=5)
         panel.send("\r")
         panel.expect("install runs against the node", "pkg.install sl", timeout=30)
+        check("install finished and reported", finished(panel, "installing sl"), panel.text[-400:])
+
+        # SSH inside the panel: detach keeps it running, resume shows the same
+        # screen, and only `x` from the panel ends it.
+        panel.send("s")
+        panel.expect("ssh opens inside the panel", "msm  ssh  root@", timeout=25)
+        panel.send(
+            "echo SSH-OK; n=0; while true; do n=$((n+1)); echo tick-$n; sleep 1; done\r",
+            delay=0.8,
+        )
+        panel.expect("a command runs inside the ssh session", "SSH-OK", timeout=20)
+        panel.expect("the shell keeps printing", "tick-2", timeout=20)
+
+        # 0x1c is ctrl-\ on a terminal with the kitty protocol and ctrl-4 on
+        # one without; the probe's pty has no protocol, so this is the path a
+        # stock terminal takes. The second detach below uses esc.
+        panel.send("\x1c")
+        panel.expect("ctrl-\\ detaches to the node list", "msm  nodes", timeout=15)
         check(
-            "install reported a real result",
-            panel.read_until("exit 0 via", timeout=150),
+            "the row says the login was left running",
+            "detached" in panel.text,
+            panel.text[-400:],
+        )
+        time.sleep(2.0)
+
+        panel.send("s")
+        panel.expect("s resumes the same login", "msm  ssh  root@", timeout=20)
+        resumed = re.search(r"tick-(\d+)", panel.text)
+        check(
+            "the detached shell kept writing while it was away",
+            resumed is not None and int(resumed.group(1)) >= 3,
             panel.text[-400:],
         )
 
-        panel.send("s")
-        opened = panel.read_until("root@", timeout=20)
-        check("ssh took the terminal", opened, panel.text[-300:])
-        panel.send("echo SSH-OK\r", delay=0.7)
-        panel.expect("a command runs inside the ssh session", "SSH-OK", timeout=20)
-        panel.send("exit\r", delay=0.7)
-        panel.expect("the panel comes back after ssh", "msm  " + expect_label, timeout=25)
-        check("the panel redrew the node screen", "load" in panel.text or "samples" in panel.text)
+        panel.send("\x1b")
+        panel.expect("esc detaches again", "msm  nodes", timeout=15)
+        panel.send("x")
+        panel.expect("x terminates the login", "terminated", timeout=15)
+
+        panel.send("\r")
+        panel.expect("the node screen is back", "msm  " + expect_label, timeout=15)
 
         panel.send("f")
         panel.expect("sftp takes the terminal with the same key", "sftp>", timeout=20)

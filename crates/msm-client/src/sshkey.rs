@@ -373,7 +373,10 @@ pub fn parse_public_key(pem: &str) -> Result<String> {
         ));
     }
 
-    Ok(format!("ssh-ed25519 {} {COMMENT}", b64::encode(public_blob)))
+    Ok(format!(
+        "ssh-ed25519 {} {COMMENT}",
+        b64::encode(public_blob)
+    ))
 }
 
 fn read_u32(data: &[u8], at: usize) -> Result<u32> {
@@ -406,11 +409,20 @@ mod tests {
     #[test]
     fn ssh_key_roundtrip() {
         let key = SshKey::generate().expect("generate");
-        assert!(key.private_pem.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----\n"));
-        assert!(key.private_pem.ends_with("-----END OPENSSH PRIVATE KEY-----\n"));
+        assert!(
+            key.private_pem
+                .starts_with("-----BEGIN OPENSSH PRIVATE KEY-----\n")
+        );
+        assert!(
+            key.private_pem
+                .ends_with("-----END OPENSSH PRIVATE KEY-----\n")
+        );
         assert!(key.public_line.starts_with("ssh-ed25519 "));
         assert!(key.public_line.ends_with(&format!(" {COMMENT}")));
-        assert_eq!(parse_public_key(&key.private_pem).expect("parse"), key.public_line);
+        assert_eq!(
+            parse_public_key(&key.private_pem).expect("parse"),
+            key.public_line
+        );
     }
 
     #[test]
@@ -439,8 +451,14 @@ mod tests {
             .expect("seed");
 
         let node = SshKey::generate().expect("node key");
-        assert!(trust_at(&path, &node.public_line).expect("trust"), "first sight is added");
-        assert!(!trust_at(&path, &node.public_line).expect("again"), "second sight is a no-op");
+        assert!(
+            trust_at(&path, &node.public_line).expect("trust"),
+            "first sight is added"
+        );
+        assert!(
+            !trust_at(&path, &node.public_line).expect("again"),
+            "second sight is a no-op"
+        );
 
         let text = fs::read_to_string(&path).expect("read");
         assert_eq!(text.lines().count(), 2, "{text}");

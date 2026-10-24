@@ -99,9 +99,18 @@ python3 scripts/tui_probe.py --binary target/debug/msm \
 ```
 
 It types into a real terminal: pair from a discovered result, list the node,
-open it, wait for the sparkline, run an update and an install, hand the
-terminal to `ssh` and `sftp` and come back, resize, quit. A redraw bug or a
-swallowed key shows up here and nowhere else.
+open it, wait for the sparkline, run an update and an install, open an SSH
+login in the panel, detach it with `ctrl-\` (the byte `0x1c`, which needs no
+keyboard protocol), resume it with `s` and see the output that arrived while it
+was detached, detach again with `esc`, end it with `x` from the panel, hand the
+terminal to `sftp` and come back, resize, quit. A redraw bug or a swallowed key
+shows up here and nowhere else.
+
+Sizing is covered twice: `tui/tests.rs` renders every screen at 80x24, 100x30
+and 40x15 and asserts the panel fills the terminal exactly (header on the first
+row, help on the last, no extra row), and the live pty run prints a marker on
+the remote's own last row and on a resized terminal, so the SSH grid is proven
+to be sized from the measured chrome rather than a guessed constant.
 
 ## 4. Packages, from a staging repository
 

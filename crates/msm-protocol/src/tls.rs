@@ -204,9 +204,8 @@ impl ServerCertVerifier for PinVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        let spki = spki_from_cert_der(end_entity.as_ref()).map_err(|_| {
-            rustls::Error::General("peer identity is not an Ed25519 key".into())
-        })?;
+        let spki = spki_from_cert_der(end_entity.as_ref())
+            .map_err(|_| rustls::Error::General("peer identity is not an Ed25519 key".into()))?;
 
         if let Some(expected) = &self.pin {
             if expected.ct_eq(&spki).unwrap_u8() != 1 {

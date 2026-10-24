@@ -39,7 +39,12 @@ fn frame_roundtrip() {
     let exact = vec![b'a'; MAX_FRAME_LEN];
     buffer.clear();
     write_frame(&mut buffer, &exact).expect("write at cap");
-    assert_eq!(read_frame(&mut buffer.as_slice()).expect("read at cap").len(), MAX_FRAME_LEN);
+    assert_eq!(
+        read_frame(&mut buffer.as_slice())
+            .expect("read at cap")
+            .len(),
+        MAX_FRAME_LEN
+    );
 }
 
 #[test]
@@ -171,11 +176,18 @@ fn code_normalise() {
         ("zzzzzzzz", "ZZZZZZZZ"),
     ];
     for (input, want) in accepted {
-        assert_eq!(normalize_code(input).expect("accepted"), want, "input {input:?}");
+        assert_eq!(
+            normalize_code(input).expect("accepted"),
+            want,
+            "input {input:?}"
+        );
     }
 
     for input in ["", "7K3M9QX", "7K3M9QXAA", "7K3M9QXA!", "U7K3M9QX"] {
-        assert!(normalize_code(input).is_err(), "input {input:?} was accepted");
+        assert!(
+            normalize_code(input).is_err(),
+            "input {input:?} was accepted"
+        );
     }
 }
 
@@ -276,8 +288,8 @@ fn spki_ed25519() {
     assert!(spki_from_cert_der(&[0u8; 200]).is_err());
 
     // A stored identity keeps the same pin.
-    let restored =
-        Identity::from_stored(&identity.id_b64(), &identity.key_b64(), "msm-node").expect("restore");
+    let restored = Identity::from_stored(&identity.id_b64(), &identity.key_b64(), "msm-node")
+        .expect("restore");
     assert_eq!(restored.spki(), identity.spki());
     assert_eq!(restored.id(), identity.id());
 }
@@ -409,8 +421,14 @@ fn command_builders() {
         }
     );
     assert_eq!(Command::LogsTail(5).describe(), "logs.tail 5");
-    assert_eq!(Command::SvcRestart(String::new()).describe(), "svc.restart self");
-    assert_eq!(Command::HostReboot("reboot".into()).describe(), "host.reboot");
+    assert_eq!(
+        Command::SvcRestart(String::new()).describe(),
+        "svc.restart self"
+    );
+    assert_eq!(
+        Command::HostReboot("reboot".into()).describe(),
+        "host.reboot"
+    );
     assert_eq!(
         Command::NodeSetup(Setup {
             run_as: "root".into(),
@@ -456,9 +474,7 @@ fn setup_travels_only_when_answered() {
     )
     .expect("decode an older pair.ok");
     match older {
-        Message::PairOk {
-            ssh_key, setup, ..
-        } => {
+        Message::PairOk { ssh_key, setup, .. } => {
             assert!(ssh_key.is_empty());
             assert!(setup.is_none());
         }
@@ -469,7 +485,8 @@ fn setup_travels_only_when_answered() {
 #[test]
 fn command_result_envelope() {
     // A refusal as the Go node writes it: absent members are absent, not null.
-    let refused = br#"{"t":"result","v":1,"id":"req-1","ok":false,"code":"bad_argument","detail":"nope"}"#;
+    let refused =
+        br#"{"t":"result","v":1,"id":"req-1","ok":false,"code":"bad_argument","detail":"nope"}"#;
     match messages::decode(refused).expect("decode refusal") {
         Message::Result {
             id,
@@ -512,7 +529,14 @@ fn command_result_envelope() {
 
 #[test]
 fn package_name_charset() {
-    for name in ["aero", "ripgrep-14", "libstdc++", "python3.11:amd64", "node_18", "a"] {
+    for name in [
+        "aero",
+        "ripgrep-14",
+        "libstdc++",
+        "python3.11:amd64",
+        "node_18",
+        "a",
+    ] {
         assert!(valid_package_name(name), "{name} should be accepted");
     }
 
@@ -572,6 +596,13 @@ fn command_payloads() {
     assert_eq!(parsed.manager, "dnf");
     assert_eq!(parsed.commands, vec![vec!["dnf", "-y", "install", "dpkg"]]);
     assert_eq!(parsed.exit_code, -1);
+    // A node from before §8.5 grew a summary sends none, and that is not an
+    // error: the field is optional on the wire.
+    assert_eq!(parsed.summary, None);
+
+    let payload = br#"{"manager":"dnf","commands":[["dnf","-y","upgrade"]],"exit_code":0,"output":"Nothing to do.","summary":"there were no updates"}"#;
+    let parsed: PackageResult = serde_json::from_slice(payload).expect("package payload");
+    assert_eq!(parsed.summary.as_deref(), Some("there were no updates"));
 
     let payload = br#"{"load1":0.5,"load5":0.25,"load15":0.1,"cpu_count":2,"mem_total_kb":1024,"mem_available_kb":512,"uptime_s":9,"disk_total_kb":2048,"disk_available_kb":1024}"#;
     let metrics: MetricsResult = serde_json::from_slice(payload).expect("metrics payload");

@@ -124,6 +124,12 @@ pub struct PackageResult {
     pub commands: Vec<Vec<String>>,
     pub exit_code: i64,
     pub output: String,
+    /// The outcome in one sentence — "there were no updates", "3 packages
+    /// were updated", "figlet was installed". Display text only: `exit_code`
+    /// is what says whether the run succeeded. Absent from older nodes, so
+    /// readers fall back to the exit code and manager name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// `svc.restart` payload (§8.7).
@@ -220,9 +226,9 @@ pub fn valid_account(name: &str) -> bool {
     if !(first.is_ascii_lowercase() || first == b'_') {
         return false;
     }
-    bytes
-        .iter()
-        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.' | b'-'))
+    bytes.iter().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.' | b'-')
+    })
 }
 
 /// Request ids travel back in a `result`, so they stay to a printable alphabet.

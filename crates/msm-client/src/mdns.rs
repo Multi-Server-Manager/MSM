@@ -63,9 +63,9 @@ pub fn browse(window: Duration) -> Result<Vec<Discovered>> {
         }
     }
 
-    records.finish().map_err(|_| {
-        ProtocolError::Internal("an mDNS answer could not be parsed".to_string())
-    })
+    records
+        .finish()
+        .map_err(|_| ProtocolError::Internal("an mDNS answer could not be parsed".to_string()))
 }
 
 /// The PTR question for the service type.

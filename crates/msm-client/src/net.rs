@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use msm_protocol::b64;
 use msm_protocol::code::normalize_code;
-use msm_protocol::derive::{Transcript, client_proof, mac_eq, node_proof, pair_keys};
 use msm_protocol::commands::{Command, SshAuthorizeResult};
+use msm_protocol::derive::{Transcript, client_proof, mac_eq, node_proof, pair_keys};
 use msm_protocol::messages::{self, Message, Setup};
 use msm_protocol::tls::{Identity, client_config, server_name, spki_from_cert_der};
 use msm_protocol::{ProtocolError, Result, read_frame, write_frame};
@@ -98,7 +98,9 @@ pub fn pair(
                 op_port,
                 ..
             } => (eph, nonce, node_id, node_spki, op_port),
-            Message::Error { code, detail, .. } => return Err(ProtocolError::Peer { code, detail }),
+            Message::Error { code, detail, .. } => {
+                return Err(ProtocolError::Peer { code, detail });
+            }
             other => {
                 return Err(ProtocolError::UnknownType(format!(
                     "expected pair.challenge, got {}",
@@ -171,14 +173,16 @@ pub fn pair(
                 warn,
                 ..
             } => (mac, node_id, node_spki, op_port, ssh_key, setup, warn),
-        Message::Error { code, detail, .. } => return Err(ProtocolError::Peer { code, detail }),
-        other => {
-            return Err(ProtocolError::UnknownType(format!(
-                "expected pair.ok, got {}",
-                other.kind()
-            )));
-        }
-    };
+            Message::Error { code, detail, .. } => {
+                return Err(ProtocolError::Peer { code, detail });
+            }
+            other => {
+                return Err(ProtocolError::UnknownType(format!(
+                    "expected pair.ok, got {}",
+                    other.kind()
+                )));
+            }
+        };
 
     if ack_node_id != node_id_text || ack_spki != node_spki_text || ack_port != op_port {
         return Err(ProtocolError::BadProof(
@@ -187,7 +191,9 @@ pub fn pair(
     }
     let received = b64::decode_n::<32>(&ack_mac)?;
     if !mac_eq(&node_proof(&node_key, &transcript), &received) {
-        return Err(ProtocolError::BadProof("the node proof did not verify".into()));
+        return Err(ProtocolError::BadProof(
+            "the node proof did not verify".into(),
+        ));
     }
 
     let ssh_key = SshKey::load_or_create(state_dir)?;
@@ -205,7 +211,11 @@ pub fn pair(
         } else {
             setup.ssh_user.clone()
         },
-        ssh_port: if setup.ssh_port == 0 { 22 } else { setup.ssh_port },
+        ssh_port: if setup.ssh_port == 0 {
+            22
+        } else {
+            setup.ssh_port
+        },
     });
     let record = NodeRecord {
         node_id: node_id_text,
@@ -227,7 +237,7 @@ pub fn pair(
     if !ack_warn.is_empty() {
         warnings.push(ack_warn);
     }
-    if let Err(err) = authorize_ssh_key(state_dir, &record, &ssh_key.public_line, &record.ssh_user) {
+    if let Err(err) = install_console_key(state_dir, &record, &ssh_key.public_line) {
         warnings.push(format!("the console key was not installed: {err}"));
     }
 
@@ -247,6 +257,33 @@ pub fn pair(
             Some(warnings.join("; "))
         },
     })
+}
+
+/// How many times pairing asks the node to install the console's key.
+const KEY_INSTALL_ATTEMPTS: u32 = 6;
+/// The pause between those attempts.
+const KEY_INSTALL_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Install the console's key for the account that will receive the login,
+/// retrying while the node finishes the restart that follows pairing.
+///
+/// A node started from a terminal detaches as soon as it is paired: it closes
+/// the listener pairing ran on and re-execs in the background. The first
+/// request therefore meets a socket that is already gone, which used to leave
+/// the console with no way in (`the console key was not installed`) on exactly
+/// the nodes an operator set up by hand.
+fn install_console_key(state_dir: &Path, record: &NodeRecord, key: &str) -> Result<()> {
+    let mut last = None;
+    for attempt in 0..KEY_INSTALL_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(KEY_INSTALL_PAUSE);
+        }
+        match authorize_ssh_key(state_dir, record, key, &record.ssh_user) {
+            Ok(_) => return Ok(()),
+            Err(err) => last = Some(err),
+        }
+    }
+    Err(last.expect("at least one attempt ran"))
 }
 
 /// Change the node's setup answers and record what it now uses.

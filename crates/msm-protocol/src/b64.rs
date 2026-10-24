@@ -18,7 +18,7 @@ pub fn decode(text: &str) -> Result<Vec<u8>> {
 /// Decode a binary field that must have an exact length.
 pub fn decode_n<const N: usize>(text: &str) -> Result<[u8; N]> {
     let bytes = decode(text)?;
-    bytes.try_into().map_err(|_| {
-        ProtocolError::BadFrame(format!("field is not {N} bytes"))
-    })
+    bytes
+        .try_into()
+        .map_err(|_| ProtocolError::BadFrame(format!("field is not {N} bytes")))
 }

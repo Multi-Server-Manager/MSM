@@ -40,8 +40,8 @@ impl Transcript<'_> {
             self.client_spki,
         ];
         for field in fields {
-            let length = u16::try_from(field.len())
-                .expect("transcript fields are far shorter than 64 KiB");
+            let length =
+                u16::try_from(field.len()).expect("transcript fields are far shorter than 64 KiB");
             digest.update(length.to_be_bytes());
             digest.update(field);
         }

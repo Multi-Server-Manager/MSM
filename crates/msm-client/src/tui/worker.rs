@@ -72,13 +72,7 @@ pub enum Msg {
 }
 
 /// Run one command against one node and report start, result and payload.
-pub fn action(
-    state_dir: PathBuf,
-    record: NodeRecord,
-    request: Command,
-    id: u64,
-    tx: Sender<Msg>,
-) {
+pub fn action(state_dir: PathBuf, record: NodeRecord, request: Command, id: u64, tx: Sender<Msg>) {
     thread::spawn(move || {
         let node = record.node_id.clone();
         if tx
@@ -123,19 +117,13 @@ pub fn action(
                 if ok {
                     (true, describe_success(data.as_ref()))
                 } else {
-                    (
-                        false,
-                        human::refusal(code.as_deref(), detail.as_deref()),
-                    )
+                    (false, human::refusal(code.as_deref(), detail.as_deref()))
                 }
             }
             Ok(Message::Error { code, detail, .. }) => {
                 (false, human::refusal(Some(&code), Some(&detail)))
             }
-            Ok(other) => (
-                false,
-                format!("unexpected {} reply", other.kind()),
-            ),
+            Ok(other) => (false, format!("unexpected {} reply", other.kind())),
             Err(err) => (false, human::command(&err, &address)),
         };
 
@@ -150,24 +138,12 @@ pub fn action(
 
 /// Ask one node for its metrics (background, no progress line).
 pub fn metrics(state_dir: PathBuf, record: NodeRecord, tx: Sender<Msg>) {
-    action(
-        state_dir,
-        record,
-        Command::MetricsSample,
-        BACKGROUND,
-        tx,
-    );
+    action(state_dir, record, Command::MetricsSample, BACKGROUND, tx);
 }
 
 /// Ask one node for the tail of its log (background, no progress line).
 pub fn logs(state_dir: PathBuf, record: NodeRecord, lines: u32, tx: Sender<Msg>) {
-    action(
-        state_dir,
-        record,
-        Command::LogsTail(lines),
-        BACKGROUND,
-        tx,
-    );
+    action(state_dir, record, Command::LogsTail(lines), BACKGROUND, tx);
 }
 
 /// Pair with a node and install the console's SSH key.
@@ -179,8 +155,8 @@ pub fn pair(
     setup: Setup,
     tx: Sender<Msg>,
 ) {
-    thread::spawn(move || {
-        match net::pair(&state_dir, &addr, &code, &label, &setup) {
+    thread::spawn(
+        move || match net::pair(&state_dir, &addr, &code, &label, &setup) {
             Ok(outcome) => {
                 let _ = tx.send(Msg::Paired {
                     record: Box::new(outcome.record),
@@ -190,8 +166,8 @@ pub fn pair(
             Err(err) => {
                 let _ = tx.send(Msg::Failed(human::pairing(&err, &addr)));
             }
-        }
-    });
+        },
+    );
 }
 
 /// Push edited answers to a node, then make sure the console key is installed
@@ -274,7 +250,17 @@ fn describe_success(data: Option<&Value>) -> String {
         return "ok".to_string();
     };
     match serde_json::from_value::<PackageResultView>(data.clone()) {
-        Ok(package) => format!("exit {} via {}", package.exit_code, package.manager),
+        // The node names the outcome in a sentence. Only an older node (or a
+        // run that never reached the manager) has nothing better than numbers.
+        Ok(package) => package
+            .summary
+            .filter(|summary| !summary.is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "finished via {} (exit {})",
+                    package.manager, package.exit_code
+                )
+            }),
         Err(_) => "ok".to_string(),
     }
 }
@@ -283,4 +269,6 @@ fn describe_success(data: Option<&Value>) -> String {
 struct PackageResultView {
     manager: String,
     exit_code: i64,
+    #[serde(default)]
+    summary: Option<String>,
 }

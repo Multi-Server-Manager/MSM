@@ -12,8 +12,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use std::time::Duration;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use russh::ChannelMsg;
@@ -269,7 +269,9 @@ pub fn key_bytes(key: KeyEvent) -> Vec<u8> {
     let mut bytes = match key.code {
         KeyCode::Char(character) => {
             if control {
-                control_byte(character).map(|byte| vec![byte]).unwrap_or_default()
+                control_byte(character)
+                    .map(|byte| vec![byte])
+                    .unwrap_or_default()
             } else {
                 character.to_string().into_bytes()
             }
@@ -461,7 +463,9 @@ mod live_tests {
                     }
                 }
                 Ok(Event::Opened) => {}
-                Ok(Event::Closed(reason)) => panic!("session closed early: {reason}\nafter: {seen}"),
+                Ok(Event::Closed(reason)) => {
+                    panic!("session closed early: {reason}\nafter: {seen}")
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => panic!("session thread ended: {seen}"),
             }

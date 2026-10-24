@@ -323,11 +323,20 @@ Members that do not apply are **absent**, not empty strings or nulls.
 { "manager": "dnf|apt|pacman|apk",
   "commands": [["dnf","-y","upgrade"]],
   "exit_code": 0,
-  "output": "…" }
+  "output": "…",
+  "summary": "3 packages were updated" }
 ```
 
 `commands` is the exact argv sequence that was executed, in order. The node
 detects one manager and refuses with `unsupported` when none is present.
+
+`summary` is the outcome in one sentence, read from the manager's own report:
+`there were no updates`, `<n> packages were updated` (or `1 package was
+updated`), `<name> was installed`, `<name> was already installed`, and `the
+update finished` when the report was not in the output tail. It is **display
+text only** — `exit_code` still decides whether the run succeeded — and it is
+absent when the run did not reach the manager. A console that does not know the
+member ignores it and falls back to `exit_code` and `manager`.
 
 ### 8.6 `pkg.install` data
 

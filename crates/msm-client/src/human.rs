@@ -18,9 +18,7 @@ pub fn pairing(err: &ProtocolError, address: &str) -> String {
                 "the node rejected that code. Check the eight characters and try again".to_string()
             }
             "expired" => "that code expired; the node printed a new one".to_string(),
-            "abuse" => {
-                "too many wrong codes; the node printed a new one in its window".to_string()
-            }
+            "abuse" => "too many wrong codes; the node printed a new one in its window".to_string(),
             "bad_version" => {
                 "the node speaks a different protocol version; update both sides".to_string()
             }
@@ -124,7 +122,10 @@ mod tests {
 
     #[test]
     fn wrong_code_says_what_to_do() {
-        let message = pairing(&peer("bad_proof", "pairing proof did not verify"), "10.0.0.4:7334");
+        let message = pairing(
+            &peer("bad_proof", "pairing proof did not verify"),
+            "10.0.0.4:7334",
+        );
         assert!(message.contains("rejected that code"), "{message}");
         assert!(message.contains("try again"), "{message}");
         assert!(!message.contains("bad_proof"), "{message}");
@@ -181,8 +182,10 @@ mod tests {
     fn command_refusals_are_sentences() {
         assert!(refusal(Some("busy"), Some("pkg.update is running")).starts_with("busy:"));
         assert!(refusal(Some("unauthorized"), None).contains("pair it again"));
-        assert!(refusal(Some("bad_argument"), Some("not a package name"))
-            .contains("not a package name"));
+        assert!(
+            refusal(Some("bad_argument"), Some("not a package name"))
+                .contains("not a package name")
+        );
         assert!(refusal(Some("unsupported"), None).contains("cannot run"));
         assert!(refusal(Some("confirmation_required"), None).contains("confirmation"));
         assert!(!refusal(Some("internal"), Some("no package manager")).contains("internal:"));

@@ -347,7 +347,9 @@ fn run(mut cli: Cli) -> Result<ExitCode, Failure> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Invocation::Update { selection } => dispatch(&cli.state_dir, &selection, Request::PkgUpdate),
+        Invocation::Update { selection } => {
+            dispatch(&cli.state_dir, &selection, Request::PkgUpdate)
+        }
         Invocation::Install { name, selection } => {
             dispatch(&cli.state_dir, &selection, Request::PkgInstall(name))
         }

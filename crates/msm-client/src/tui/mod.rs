@@ -3,20 +3,30 @@
 //! The terminal belongs to the panel for the whole run. An SSH login is drawn
 //! in the same screen (see `session`); only `sftp`, a file browser rather than
 //! a shell, borrows the terminal and gives it back when it exits.
+//!
+//! The code is split by concern: `app` owns the state and the key handling,
+//! `ui` draws that state and never writes it, and `crate::session` is the SSH
+//! transport underneath both. See the module docs of `app` and `ui` for the
+//! file map and for the sizes that have a single owner.
 
 pub mod app;
-pub mod ui;
 #[cfg(test)]
 mod tests;
+pub mod theme;
+pub mod ui;
 mod worker;
 
 use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{
+    self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::terminal::{
-    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+    enable_raw_mode,
 };
 use crossterm::{cursor, execute};
 use ratatui::Terminal;
@@ -37,22 +47,42 @@ pub fn run(state_dir: &Path) -> Result<()> {
     }
 
     let mut app = App::new(state_dir)?;
-    let mut panel = enter()?;
+    let (mut panel, ctrl_m) = enter()?;
+    app.ctrl_m = ctrl_m;
     let outcome = event_loop(&mut panel, &mut app);
-    leave(&mut panel)?;
+    leave(&mut panel, ctrl_m)?;
     outcome
 }
 
-fn enter() -> Result<Panel> {
+/// Take the terminal for the panel. The second answer says whether Ctrl-M can
+/// be told apart from Enter, which decides whether `ctrl-m` is a detach chord.
+///
+/// The byte for Ctrl-M is CR, exactly what Enter sends, so without the kitty
+/// keyboard protocol a terminal cannot report it as anything but Enter. Asking
+/// for the disambiguated codes costs nothing where it is unsupported and keeps
+/// Enter free for the shell everywhere.
+fn enter() -> Result<(Panel, bool)> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, Clear(ClearType::All))?;
+
+    let ctrl_m = terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if ctrl_m {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
+
     let panel = Terminal::new(CrosstermBackend::new(stdout))
         .map_err(|err| ProtocolError::Internal(format!("cannot start the panel: {err}")))?;
-    Ok(panel)
+    Ok((panel, ctrl_m))
 }
 
-fn leave(panel: &mut Panel) -> Result<()> {
+fn leave(panel: &mut Panel, ctrl_m: bool) -> Result<()> {
+    if ctrl_m {
+        execute!(panel.backend_mut(), PopKeyboardEnhancementFlags)?;
+    }
     disable_raw_mode()?;
     execute!(
         panel.backend_mut(),
@@ -82,16 +112,24 @@ fn event_loop(panel: &mut Panel, app: &mut App) -> Result<()> {
         if let Some(shell) = app.shell.take() {
             match hand_over(panel, &shell) {
                 Ok(status) => {
-                    app.status = format!(
-                        "{}{}",
-                        shell.program,
-                        match status.code() {
-                            Some(code) => format!(" exited {code}"),
-                            None => " ended".to_string(),
-                        }
+                    let code = status.code();
+                    let kind = match code {
+                        Some(0) | None => app::Severity::Info,
+                        Some(_) => app::Severity::Error,
+                    };
+                    app.report(
+                        kind,
+                        format!(
+                            "{}{}",
+                            shell.program,
+                            match code {
+                                Some(code) => format!(" exited {code}"),
+                                None => " ended".to_string(),
+                            }
+                        ),
                     );
                 }
-                Err(err) => app.status = err,
+                Err(err) => app.report(app::Severity::Error, err),
             }
             continue;
         }
@@ -111,7 +149,9 @@ fn event_loop(panel: &mut Panel, app: &mut App) -> Result<()> {
         if event::poll(wait)? {
             loop {
                 match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        app.on_key(key);
+                    }
                     // Resize is handled by the next draw; releases and focus
                     // changes carry no command.
                     _ => {}
@@ -126,7 +166,10 @@ fn event_loop(panel: &mut Panel, app: &mut App) -> Result<()> {
 }
 
 /// Give the terminal to a child process, then take it back.
-fn hand_over(panel: &mut Panel, shell: &app::Shell) -> std::result::Result<std::process::ExitStatus, String> {
+fn hand_over(
+    panel: &mut Panel,
+    shell: &app::Shell,
+) -> std::result::Result<std::process::ExitStatus, String> {
     disable_raw_mode().map_err(|err| err.to_string())?;
     execute!(panel.backend_mut(), LeaveAlternateScreen, cursor::Show)
         .map_err(|err| err.to_string())?;
@@ -137,8 +180,7 @@ fn hand_over(panel: &mut Panel, shell: &app::Shell) -> std::result::Result<std::
         .map_err(|err| format!("cannot start {}: {err}", shell.program));
 
     enable_raw_mode().map_err(|err| err.to_string())?;
-    execute!(panel.backend_mut(), EnterAlternateScreen)
-        .map_err(|err| err.to_string())?;
+    execute!(panel.backend_mut(), EnterAlternateScreen).map_err(|err| err.to_string())?;
     panel
         .clear()
         .map_err(|err| format!("cannot redraw the panel: {err}"))?;

@@ -43,6 +43,7 @@ msm setup sanas --ssh-port 2200            # change the answers, no restart
 | `u` `i` `r` `l` | update, install, restart, logs |
 | `s` | SSH login **inside the panel** |
 | `e` | edit name, address, ssh user/port and the account commands run as |
+| `x` | end the SSH login of the highlighted node |
 | `f` | sftp (hands the terminal over) |
 | `p`, `q` | pair, quit |
 

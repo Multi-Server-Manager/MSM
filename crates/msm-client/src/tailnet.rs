@@ -126,17 +126,18 @@ fn probe(identity: &msm_protocol::tls::Identity, address: SocketAddr) -> Option<
     match reply {
         Message::PairChallenge {
             node_id, node_spki, ..
-        } => Some(Greeting {
-            node_id,
-            node_spki,
-        }),
+        } => Some(Greeting { node_id, node_spki }),
         _ => None,
     }
 }
 
 /// Every online peer Tailscale knows about, with an IPv4 address to try.
 fn peers() -> Vec<Peer> {
-    let output = match Command::new(tailscale_binary()).arg("status").arg("--json").output() {
+    let output = match Command::new(tailscale_binary())
+        .arg("status")
+        .arg("--json")
+        .output()
+    {
         Ok(output) if output.status.success() => output,
         _ => return Vec::new(),
     };
@@ -230,7 +231,13 @@ mod tests {
         let usable = entries
             .values()
             .filter(|peer| peer["Online"] == true)
-            .filter(|peer| peer["TailscaleIPs"][0].as_str().unwrap().parse::<Ipv4Addr>().is_ok())
+            .filter(|peer| {
+                peer["TailscaleIPs"][0]
+                    .as_str()
+                    .unwrap()
+                    .parse::<Ipv4Addr>()
+                    .is_ok()
+            })
             .count();
         assert_eq!(usable, 1);
     }

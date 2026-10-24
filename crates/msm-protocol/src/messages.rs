@@ -131,11 +131,7 @@ pub enum Message {
     SvcRestart { v: u16, id: String, unit: String },
 
     #[serde(rename = "host.reboot")]
-    HostReboot {
-        v: u16,
-        id: String,
-        confirm: String,
-    },
+    HostReboot { v: u16, id: String, confirm: String },
 
     #[serde(rename = "metrics.sample")]
     MetricsSample { v: u16, id: String },
